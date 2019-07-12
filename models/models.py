@@ -7,6 +7,7 @@ from odoo import http
 from odoo import exceptions
 import json
 from odoo import models, fields, api
+import datetime
 import sys
 sys.path.append('.\\.\\server')
 _logger = logging.getLogger(__name__)
@@ -500,7 +501,7 @@ class Voucher(models.Model):
 
     @api.model
     def _updateAccountBalance(self, entry, isAdd=True):
-        '''更新科目余额'''
+        '''新增和修改凭证，更新科目余额'''
         item = entry.getItemByitemClass(entry.account.accountItemClass)
         if item:
             itemId = item.id
@@ -516,50 +517,91 @@ class Voucher(models.Model):
         accountBalanceTable = self.env['accountcore.accounts_balance']
         accountBalanceMark = AccountBalanceMark(
             orgId=self.org.id, accountId=entry.account.id, itemId=itemId, createDate=self.voucherdate, accountBalanceTable=accountBalanceTable, isbegining=False)
-        accountBalance = self._getBalanceRecord(entry.account.id)
-        if accountBalance.exists():  # 当月已经存在该科目的记录
-            if entry_damount != 0:
-                accountBalance.changeDamount(entry_damount)
-            elif entry_camount != 0:
-                accountBalance.changeCamount(entry_camount)
-            accountBalance.changNextBalanceBegining()
+        # if 一条会计分录有核算项目
+        if entry.items:
+            for item_ in entry.items:
+                accountBalance = self._getBalanceRecord(
+                    entry.account.id, item_.id)
+                # if 当月已经存在一条该科目的余额记录（不包括启用期初余额那条）
+                if accountBalance.exists():
+                    self._modifyBalance(
+                        entry_damount, accountBalance, entry_camount)
+                # else 不存在就新增一条,但必须是科目的必选核算项目类
+                elif item_.id == itemId:
+                    self._buildBalance(True, accountBalanceMark, entry,
+                                      entry_damount, entry_camount)
+        # else 一条会计分录没有核算项目
         else:
-            pre_balanceRecords = accountBalanceMark.get_pre_balanceRecords()
-            next_balanceRecords = accountBalanceMark.get_next_balanceRecords()
-            if itemId:
-                # newBalanceInfo = {'org': orgId, 'createDate': createDate, 'year': year, 'month': month,
-                #                   'account': accountId, 'items': itemId, 'isbegining': False}
-                newBalanceInfo = dict(accountBalanceMark)
+            accountBalance = self._getBalanceRecord(
+                entry.account.id)
+            # if 当月已经存在一条该科目的余额记录（不包括启用期初余额那条）
+            if accountBalance.exists():
+                self._modifyBalance(
+                    entry_damount, accountBalance, entry_camount)
+            # else 不存在就新增一条
             else:
-                accountBalanceMark.items = None
-                newBalanceInfo = dict(accountBalanceMark)
-                # newBalanceInfo = {'org': orgId, 'createDate': createDate, 'year': year, 'month': month,
-                #                   'account': accountId, 'isbegining': False}
-            if pre_balanceRecords.exists():
-                pre_record = pre_balanceRecords[-1]
-                newBalanceInfo['preRecord'] = pre_record.id
-                newBalanceInfo['beginingDamount'] = pre_record.beginingDamount + \
-                    pre_record.damount
-                newBalanceInfo['beginingCamount'] = pre_record.beginingCamount + \
-                    pre_record.cumulativeCamount
-            if next_balanceRecords.exists():
-                next_record = next_balanceRecords[0]
-                newBalanceInfo['nextRecord'] = next_record.id
-            if entry.damount != 0:
-                newBalanceInfo['damount'] = entry_damount
-                # accountBalanceTable.sudo().create(newBalanceInfo)
-            elif entry.camount != 0:
-                newBalanceInfo['camount'] = entry_camount
-            newBalance = accountBalanceTable.sudo().create(newBalanceInfo)
-            if pre_balanceRecords.exists():
-                pre_record.nextRecord = newBalance.id
-            newBalance.changNextBalanceBegining()
+                # 不排除启用期初那条记录
+                self._buildBalance(False, accountBalanceMark, entry,
+                                   entry_damount, entry_camount)
 
         return True
 
+    def _modifyBalance(self, entry_damount, accountBalance, entry_camount):
+        '''对已存在的科目余额记录进行修改'''
+        if entry_damount != 0:
+            # 科目借方余额=科目借方余额+凭证分录借方
+            accountBalance.addDamount(
+                entry_damount)
+        elif entry_camount != 0:
+            accountBalance.addCamount(entry_camount)
+            # 更新以后各期期初
+        accountBalance.changeNextBalanceBegining(
+            accountBalance.endDamount, accountBalance.endCamount)
+        # else 不存在就新增一条,但必须是科目的必选核算项目类
+
+    def _buildBalance(self, haveItem, accountBalanceMark, entry, entry_damount, entry_camount):
+        '''在余额表创建一条余额记录，该科目包含核算项目'''
+        accountBalanceTable = self.env['accountcore.accounts_balance']
+        # 不排除启用期初那条记录
+        pre_balanceRecords = accountBalanceMark.get_pre_balanceRecords_all()
+        # 不排除启用期初那条记录
+        next_balanceRecords = accountBalanceMark.get_next_balanceRecords_all()
+
+        if haveItem:
+            newBalanceInfo = dict(accountBalanceMark)
+        else:
+            accountBalanceMark.items = None
+            newBalanceInfo = dict(accountBalanceMark)
+        # 以前月份存在数据就根据最近一月来更新期初数据
+        if pre_balanceRecords.exists():
+            pre_record = pre_balanceRecords[-1]
+            newBalanceInfo['preRecord'] = pre_record.id
+            newBalanceInfo['beginingDamount'] = pre_record.beginingDamount + \
+                pre_record.damount
+            newBalanceInfo['beginingCamount'] = pre_record.beginingCamount + \
+                pre_record.cumulativeCamount
+        # 以后月份存在数据就添加以后最近一月那条记录的关联
+        if next_balanceRecords.exists():
+            next_record = next_balanceRecords[0]
+            newBalanceInfo['nextRecord'] = next_record.id
+
+        if entry.damount != 0:
+            newBalanceInfo['damount'] = entry_damount
+        elif entry.camount != 0:
+            newBalanceInfo['camount'] = entry_camount
+        # 创建新的余额记录
+        newBalance = accountBalanceTable.sudo().create(newBalanceInfo)
+
+        if pre_balanceRecords.exists():
+            pre_record.nextRecord = newBalance.id
+
+        # 更新以后各月的余额数据
+        newBalance.changeNextBalanceBegining(
+            newBalance.endDamount, newBalance.endCamount)
+
     @api.model
     def _getBalanceRecord(self, accountId, itemId=False):
-        '''获得分录对应期间和会计科目下的核算项目的余额记录'''
+        '''获得分录对应期间和会计科目下的核算项目的余额记录，排除启用期初那条记录'''
         balanasTable = self.env['accountcore.accounts_balance']
         org = self.org.id
         year = self.voucherdate.year
@@ -649,7 +691,7 @@ class Enty(models.Model):
 class AccountcoreUserDefaults(models.TransientModel):
     '''用户设置模型字段的默认取值'''
     _name = 'accountcoure.userdefaults'
-    _description='用户设置模型字段默认值'
+    _description = '用户设置模型字段默认值'
     default_ruleBook = fields.Many2many(
         'accountcore.rulebook', string='默认凭证标签')
     default_org = fields.Many2one('accountcore.org', string='默认机构')
@@ -887,9 +929,11 @@ class AccountsBalance(models.Model):
         ondelete='cascade')
     createDate = fields.Date(
         string="创建日期", required=True)
+    # 通过createDate生成,不要直接修改
     year = fields.Integer(string='年份', required=True,
-                          index=True)  # 通过createDate生成,不要直接修改
-    month = fields.Integer(string='月份', required=True)  # 通过createDate生成,不要直接修改
+                          index=True)
+    # 通过createDate生成,不要直接修改
+    month = fields.Integer(string='月份', required=True)
     isbegining = fields.Boolean(string="是启用期间", default=False)
     account = fields.Many2one('accountcore.account',
                               string='会计科目', required=True, index=True, ondelete='cascade')
@@ -897,27 +941,32 @@ class AccountsBalance(models.Model):
         'accountcore.itemclass', string='核算项目类别', related='account.accountItemClass')
     items = fields.Many2one('accountcore.item', string='核算项目',
                             index=True, ondelete='cascade')
-    beginingDamount = fields.Monetary(string="期初借方")  # 当月初
-    beginingCamount = fields.Monetary(string='期初贷方')
-    damount = fields.Monetary(string='本期借方金额')  # Monetory类型字段必须有currency_id
-    camount = fields.Monetary(string='本期贷方金额')  # Monetory类型字段必须有currency_id
-    cumulativeDamount = fields.Monetary(string='本年借方累计')
-    cumulativeCamount = fields.Monetary(string='本年贷方累计')
+    beginingDamount = fields.Monetary(string="期初借方", default=0)  # 当月初
+    beginingCamount = fields.Monetary(string='期初贷方', default=0)
+    # Monetory类型字段必须有currency_id
+    damount = fields.Monetary(string='本期借方金额', default=0)
+    camount = fields.Monetary(string='本期贷方金额', default=0)
+    endDamount = fields.Monetary(
+        string="期末借方余额", compute='getEndingBalance_D', store=True)
+    endCamount = fields.Monetary(
+        string="期末贷方余额", compute='getEndingBalance_C', store=True)
+    cumulativeDamount = fields.Monetary(string='本年借方累计', default=0)
+    cumulativeCamount = fields.Monetary(string='本年贷方累计', default=0)
     preRecord = fields.Many2one(
         'accountcore.accounts_balance', string='最近上一期记录')
     nextRecord = fields.Many2one(
         'accountcore.accounts_balance', string='最近后一期记录')
-    # Monetory类型字段必须有
+    # Monetory类型字段必须有,要不无法正常显示
     currency_id = fields.Many2one(
         'res.currency',
         compute='_get_company_currency',
         readonly=True,
         string="Currency",
         help='Utility field to express amount currency')
-    # Monetory 字段必须有
 
+    @api.one
     def _get_company_currency(self):
-        pass
+        self.currency_id = self.env.user.company_id.currency_id
 
     @api.onchange('createDate')
     def chage_period(self):
@@ -930,70 +979,252 @@ class AccountsBalance(models.Model):
         '''新增一条科目期初'''
         if self._check_repeat(values):
             raise exceptions.ValidationError(
-                '不能新增,因为在相同会计期间,已经存在一条相同科目的期初余额记录,请在该行记录上修改!')
+                '不能新增,因为已经存在一条相同科目的期初余额记录,请在该行记录上修改!')
         else:
             rl = super(AccountsBalance, self).create(values)
+            if rl.isbegining:
+                nextBalances = (rl.get_next_balanceRecords(True)).filtered(
+                    lambda r: r.isbegining == False)
+                preBalances = rl.get_pre_balanceRecords(False)
+                if len(nextBalances) > 0:
+                    rl.setNextBalance(nextBalances[0])
+                    rl.changeNextBalanceBegining(
+                        rl.endDamount, rl.endCamount)
+                if len(preBalances) > 0:
+                    preBalances[-1].setNextBalance(rl)
+                    rl.changePreBalanceBegining(
+                        rl.beginingDamount, rl.beginingCamount)
         return rl
-    __afterUnlinkActions = []
 
-    def __init__(self, pool, cr):
-        self.clearAfterUnlinkAction()
-        super(AccountsBalance, self).__init__(pool, cr)
-        self.addAfterUnlinkAction(self.log)
+    # __afterUnlinkActions = [] 模拟事件触发
 
-    def log(self, me):
-        for item in me:
-            _logger.info("accountcore is maked by huangtiger !" +
-                         item.account.name)
+    # def __init__(self, pool, cr):
+    #     self.clearAfterUnlinkAction()
+    #     super(AccountsBalance, self).__init__(pool, cr)
+    #     self.addAfterUnlinkAction(self.log)
 
-    def __afterUnlinkEvent(self):
-        if len(self.__afterUnlinkActions) > 0:
-            for action in self.__afterUnlinkActions:
-                action(self)
+    # def log(self, me):
+    #     for item in me:
+    #         _logger.info("accountcore is maked by huangtiger !" +
+    #                      item.account.name)
 
-    def addAfterUnlinkAction(self, action):
-        self.__afterUnlinkActions.append(action)
+    # def __afterUnlinkEvent(self):
+    #     if len(self.__afterUnlinkActions) > 0:
+    #         for action in self.__afterUnlinkActions:
+    #             action(self)
 
-    def clearAfterUnlinkAction(self):
-        self.__afterUnlinkActions.clear()
+    # def addAfterUnlinkAction(self, action):
+    #     self.__afterUnlinkActions.append(action)
+
+    # def clearAfterUnlinkAction(self):
+    #     self.__afterUnlinkActions.clear()
 
     @api.multi
     def unlink(self):
         '''删除科目余额记录'''
-        self.__afterUnlinkEvent()
+        for mySelf in self:
+            mySelf.deleteRelatedAndUpdate()
         rl_bool = super(AccountsBalance, self).unlink()
-
         return rl_bool
+
+    @api.multi
+    def write(self, values):
+        '''修改编辑科目余额'''
+        self.ensure_one()
+        if self.isbegining:
+            if any(['account' in values, 'items' in values, 'year' in values, 'month' in values, 'org' in values]):
+                oldSelf = {}
+                oldSelf['org'] = self.org.id
+                oldSelf['createDate'] = self.createDate
+                oldSelf['year'] = self.year
+                oldSelf['month'] = self.month
+                oldSelf['account'] = self.account.id
+                if (self.items.id == False):
+                    oldSelf['items'] = None
+                else:
+                    oldSelf['items'] = self.items.id
+                oldSelf['beginingDamount'] = self.beginingDamount
+                oldSelf['beginingCamount'] = self.beginingCamount
+                oldSelf['damount'] = self.damount
+                oldSelf['camount'] = self.camount
+                oldSelf['endDamount'] = self.endDamount
+                oldSelf['endCamount'] = self.endCamount
+                oldSelf['cumulativeDamount'] = self.cumulativeDamount
+                oldSelf['cumulativeCamount'] = self.cumulativeCamount
+                oldSelf['preRecord'] = None
+                oldSelf['nextRecord'] = None
+                oldSelf['isbegining'] = self.isbegining
+                oldSelf.update(values)
+                if self._check_repeat(oldSelf):
+                    raise exceptions.ValidationError(
+                        '不能修改,因为已经存在一条相同科目的期初余额记录行,请取消,在另一行已存在的记录上修改!若不想保留本行，请进行删除操作')
+                self.deleteRelatedAndUpdate()
+                rl_bool = super(AccountsBalance, self).write(oldSelf)
+                self.buildRelatedAndUpdate()
+                return rl_bool
+            else:
+                rool_bool = super(AccountsBalance, self).write(values)
+                nextBalances = (self.get_next_balanceRecords(True)).filtered(
+                    lambda r: r.isbegining == False)
+                preBalances = self.get_pre_balanceRecords(False)
+                if len(nextBalances) > 0:
+                    self.changeNextBalanceBegining(
+                        self.endDamount, self.endCamount)
+                if len(preBalances) > 0:
+                    self.changePreBalanceBegining(
+                        self.beginingDamount, self.beginingCamount)
+                return rool_bool
+        else:
+            rl_bool = super(AccountsBalance, self).write(values)
+            return rl_bool
 
     @api.model
     def _check_repeat(self, accountBalance):
-        '''检查是否已经有一条期初记录'''
+        '''检查是否已经有一条期初或余额记录'''
         if ('items' in accountBalance):
-            records = self.search([('org', '=', accountBalance['org']), ('year', '=', accountBalance['year']), ('month', '=', accountBalance['month']), (
-                'account', '=', accountBalance['account']), ('items', '=', accountBalance['items']), ('isbegining', '=', accountBalance['isbegining'])])
+            if accountBalance['isbegining'] == True:
+                records = self.search([('org', '=', accountBalance['org']), (
+                    'account', '=', accountBalance['account']), ('items', '=', accountBalance['items']), ('isbegining', '=', True)])
+            else:
+                records = self.search([('org', '=', accountBalance['org']), ('year', '=', accountBalance['year']), ('month', '=', accountBalance['month']), (
+                    'account', '=', accountBalance['account']), ('items', '=', accountBalance['items']), ('isbegining', '=', False)])
+
         else:
-            records = self.search([('org', '=', accountBalance['org']), ('year', '=', accountBalance['year']), ('month', '=', accountBalance['month']), (
-                'account', '=', accountBalance['account']), ('isbegining', '=', accountBalance['isbegining'])])
+            if accountBalance['isbegining'] == True:
+                records = self.search([('org', '=', accountBalance['org']), (
+                    'account', '=', accountBalance['account']), ('isbegining', '=', True)])
+            else:
+                records = self.search([('org', '=', accountBalance['org']), ('year', '=', accountBalance['year']), ('month', '=', accountBalance['month']), (
+                    'account', '=', accountBalance['account']),  ('isbegining', '=', False)])
         if records.exists():
             return True
         return False
 
     @api.model
-    def changeDamount(self, amount):
+    def addDamount(self, amount):
         self.damount = self.damount+amount
 
     @api.model
-    def changeCamount(self, amount):
+    def addCamount(self, amount):
         self.camount = self.camount+amount
 
     @api.model
-    def changNextBalanceBegining(self):
+    def changeNextBalanceBegining(self, end_damount, end_camount):
+        '''更新以后各期的期初余额,依据对象的nextRecord属性,damount变动的借方'''
         if self.nextRecord:
-            self.nextRecord.beginingDamount = self.beginingDamount+self.damount
-            self.nextRecord.beginingCamount = self.beginingCamount+self.camount
-            self.nextRecord.changNextBalanceBegining()
+            nextRecord = self.nextRecord
+            nextRecord.beginingDamount = end_damount
+            nextRecord.beginingCamount = end_camount
+            nextRecord.changeNextBalanceBegining(
+                nextRecord.endDamount, nextRecord.endCamount)
         else:
             return
+
+    @api.model
+    def changePreBalanceBegining(self, begin_damount, begin_camount):
+        '''更新以前各期期的期初余额,依据对象的preRecord属性'''
+        if self.preRecord:
+            preRecord = self.preRecord
+            preRecord.beginingDamount = begin_damount-self.preRecord.damount
+            preRecord.beginingCamount = begin_camount-self.preRecord.camount
+            preRecord.changePreBalanceBegining(
+                preRecord.beginingDamount, preRecord.beginingCamount)
+        else:
+            return
+
+    @api.multi
+    @api.depends('beginingDamount', 'damount')
+    def getEndingBalance_D(self):
+        '''计算期末余额'''
+        for record in self:
+            record.endDamount = record.beginingDamount+record.damount
+        return True
+
+    @api.multi
+    @api.depends('beginingCamount', 'camount')
+    def getEndingBalance_C(self):
+        '''计算期末余额'''
+        for record in self:
+            record.endCamount = record.beginingCamount+record.camount
+        return True
+
+    def get_pre_balanceRecords(self, includeCrrentMonth=True):
+        '''获得记录科目余额的当月以前月份记录集合，默认包含当月'''
+        balanceRecords = self.get_my_balanceRecords()
+        if not includeCrrentMonth:
+            pre_balanceRecords = (balanceRecords.filtered(lambda r: (
+                r.year < self.year or (r.year == self.year and r.month < self.month)))).sorted(key=lambda a: (a.year, a.month))
+        else:
+            pre_balanceRecords = (balanceRecords.filtered(lambda r: (
+                r.year < self.year or (r.year == self.year and r.month <= self.month)))).sorted(key=lambda a: (a.year, a.month))
+        return pre_balanceRecords
+
+    def get_next_balanceRecords(self, inCludeCurrentMonth=False):
+        '''获得记录科目余额的以后月份记录集合，默认不包含当月'''
+        balanceRecords = self.get_my_balanceRecords()
+        if not inCludeCurrentMonth:
+            next_balanceRecords = (balanceRecords.filtered(lambda r: (
+                r.year > self.year or (r.year == self.year and r.month > self.month)))).sorted(key=lambda a: (a.year, a.month))
+        else:
+            next_balanceRecords = (balanceRecords.filtered(lambda r: (
+                r.year > self.year or (r.year == self.year and r.month >= self.month)))).sorted(key=lambda a: (a.year, a.month))
+        return next_balanceRecords
+
+    def get_my_balanceRecords(self):
+        '''获得记录科目余额的各月份记录集合'''
+        accountBalanceTable = self.env['accountcore.accounts_balance']
+        domain_org = ('org', '=', self.org.id)
+        domain_account = ('account', '=', self.account.id)
+        if self.items:
+            domain_item = ('items', '=', self.items.id)
+            balanceRecords = accountBalanceTable.search(
+                [domain_org, domain_account, domain_item])
+        else:
+            balanceRecords = accountBalanceTable.search(
+                [domain_org, domain_account])
+        return balanceRecords
+
+    def setNextBalance(self, accountBalance):
+        '''设置两期余额对象的关联关系'''
+        self.nextRecord = accountBalance
+        accountBalance.preRecord = self
+
+    def isSameWith(self, accountBalance):
+        '''判断两个余额对象是不是同一机构,科目和核算项目'''
+        if (self.org != accountBalance.org) or (self.account != accountBalance.account):
+            return False
+        elif self.items != AccountsBalance.items:
+            return False
+        return True
+
+    def deleteRelatedAndUpdate(self):
+        '''取消余额记录前后期的关联，同时更新关联余额'''
+        if all([self.nextRecord, (not self.preRecord)]):  # 前期没有余额记录，后期有
+            self.changeNextBalanceBegining(0, 0)
+            self.nextRecord = None
+        elif all([self.nextRecord, self.preRecord]):  # 前后期都有余额记录
+            self.preRecord.setNextBalance(self.nextRecord)
+            self.changeNextBalanceBegining(0, 0)
+            self.changePreBalanceBegining(
+                0-self.preRecord.Damount, 0-self.preRecord.Camount)
+        elif all([(not self.nextRecord), self.preRecord]):  # 前期有，后期都没有余额记录
+            self.changePreBalanceBegining(
+                0-self.preRecord.beginingDamount, 0-self.preRecord.beginingCamount)
+        return self
+
+    def buildRelatedAndUpdate(self):
+        '''新建余额记录的前后期关系，同时更新关联记录余额'''
+        nextBalances = (self.get_next_balanceRecords(True)).filtered(
+            lambda r: r.isbegining == False)
+        preBalances = self.get_pre_balanceRecords(False)
+        if len(nextBalances) > 0:
+            self.setNextBalance(nextBalances[0])
+            self.changeNextBalanceBegining(
+                self.endDamount, self.endCamount)
+        if len(preBalances) > 0:
+            preBalances[-1].setNextBalance(self)
+            self.changePreBalanceBegining(
+                self.beginingDamount, self.beginingCamount)
 
 
 class AccountBalanceMark(object):
@@ -1013,26 +1244,30 @@ class AccountBalanceMark(object):
     def __getitem__(self, item):
         return getattr(self, item)
 
-    def get_pre_balanceRecords(self):
+    def get_pre_balanceRecords_all(self):
+        '''获得相同科目余额前期记录集合，不排除期初那条'''
         accountBalanceTable = self.accountBalanceTable
         domain_org = ('org', '=', self.org)
         domain_account = ('account', '=', self.account)
         domain_item = ('items', '=', self.items)
         balanceRecords = accountBalanceTable.search(
             [domain_org, domain_account, domain_item])
+        # 该科目的前期记录集合
         pre_balanceRecords = (balanceRecords.filtered(lambda r: (
-            r.year < self.year or (r.year == self.year and r.month <= self.month)))).sorted(key=lambda a: (a.year, a.month))  # 该科目的前期记录集合
+            r.year < self.year or (r.year == self.year and r.month <= self.month)))).sorted(key=lambda a: (a.year, a.month, not a.isbegining))
         return pre_balanceRecords
 
-    def get_next_balanceRecords(self):
+    def get_next_balanceRecords_all(self):
+        '''获得相同科目余额后期记录集合，不排除期初那条'''
         accountBalanceTable = self.accountBalanceTable
         domain_org = ('org', '=', self.org)
         domain_account = ('account', '=', self.account)
         domain_item = ('items', '=', self.items)
         balanceRecords = accountBalanceTable.search(
             [domain_org, domain_account, domain_item])
+        # 该科目的后期记录集合
         next_balanceRecords = (balanceRecords.filtered(lambda r: (
-            r.year > self.year or (r.year == self.year and r.month > self.month)))).sorted(key=lambda a: (a.year, a.month))  # 该科目的后期记录集合
+            r.year > self.year or (r.year == self.year and r.month > self.month)))).sorted(key=lambda a: (a.year, a.month, not a.isbegining))
         return next_balanceRecords
 
 
@@ -1040,29 +1275,47 @@ class GetAccountsBalance(models.TransientModel):
     '''科目余额查询向导'''
     _name = 'accountcore.get_account_balance'
     _description = '科目查询向导'
-    startDate = fields.Date(string="开始期间", required=True,
-                            default=fields.Date.today())
-    endDate = fields.Date(string="结束期间", required=True,
-                          default=fields.Date.today())
+    startDate = fields.Date(string="开始期间")
+    endDate = fields.Date(string="结束期间")
     onlyShowOneLevel = fields.Boolean(string="只显示一级科目", default=False)
-    summaryLevelByLevel = fields.Boolean(string='逐级科目汇总', default=True)
+    summaryLevelByLevel = fields.Boolean(string='逐级汇总科目', default=True)
     includeAccountItems = fields.Boolean(string='包含核算项目', default=True)
-    noShowZeroBalance = fields.Boolean(string='余额为零不显示', default=False)
-    noShowUnUsed = fields.Boolean(string='从未使用不显示', default=True)
+    no_show_no_hanppend = fields.Boolean(string='不显示无发生额的科目', default=False)
+    merger_orgs = fields.Boolean(string='合并多机构相同科目', default=False)
+    noShowZeroBalance = fields.Boolean(string='不显示余额为零的科目', default=False)
+    noShowUnUsed = fields.Boolean(
+        string='从未使用不显示', default=True, readonly=True)
     org = fields.Many2many(
         'accountcore.org',
         string='机构范围',
-        default=lambda s: s.env.user.currentOrg,
+        default=lambda s: s.env.user.currentOrg, required=True
 
     )
-    account = fields.Many2many('accountcore.account', string='科目范围')
+    account = fields.Many2many(
+        'accountcore.account', string='科目范围', required=True)
 
+    @api.multi
     def doAction(self, args):
-        '''设置修改凭证编号'''
-        pass
-        return {
-            'display_name': '科目余额表',
-            'type': 'ir.actions.report',
-            'report_type': 'qweb-html',
-            'report_name': 'accountcore.account_balance_report',
+        '''查询科目余额'''
+        self.ensure_one()
+        if len(self.org) == 0:
+            raise exceptions.ValidationError('你还没选择机构范围！')
+            return False
+        if len(self.account) == 0:
+            raise exceptions.ValidationError('你需要选择查询的科目范围！')
+            return False
+        self._setDefaultDate()
+        [data] = self.read()
+        datas = {
+            'form': data
         }
+        pass
+        return self.env.ref('accountcore.accounctore_accountsbalance_report').report_action([], data=datas)
+
+    def _setDefaultDate(self):
+        if not self.startDate:
+            self.startDate = '1970-01-01'
+        if not self.endDate:
+            self.endDate = '9999-12-31'
+        if self.startDate > self.endDate:
+            raise exceptions.ValidationError('你开始日期不能大于结束日期')
