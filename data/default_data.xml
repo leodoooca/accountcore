@@ -44,7 +44,7 @@
             <field name="name">内账</field>
         </record>
         <!-- 核算项目类别 -->
-        <record id="item_calss_1" model="accountcore.itemclass">
+        <record id="item_class_1" model="accountcore.itemclass">
             <field name="number">1</field>
             <field name="name">往来</field>
         </record>
@@ -72,6 +72,10 @@
         <record id="source_1" model="accountcore.source">
             <field name="number">1</field>
             <field name="name">手工</field>
+        </record>
+        <record id="source_2" model="accountcore.source">
+            <field name="number">2</field>
+            <field name="name">机制</field>
         </record>
         <!-- 现金流量项目 -->
         <record id="cashflow_1" model="accountcore.cashflow">
@@ -406,7 +410,24 @@
 <record id='account_160' model='accountcore.account'><field name='org' eval='False' /><field name='accountClass' eval='account_class_6' /><field name='number' >6711</field><field name='name' >营业外支出</field><field name='direction' >1</field><field name='cashFlowControl' >0</field><field name='accountsArch' eval='accountsarch_1' /></record>
 <record id='account_161' model='accountcore.account'><field name='org' eval='False' /><field name='accountClass' eval='account_class_6' /><field name='number' >6801</field><field name='name' >所得税</field><field name='direction' >1</field><field name='cashFlowControl' >0</field><field name='accountsArch' eval='accountsarch_1' /></record>
 <record id='account_162' model='accountcore.account'><field name='org' eval='False' /><field name='accountClass' eval='account_class_6' /><field name='number' >6901</field><field name='name' >以前年度损益调整</field><field name='direction' >1</field><field name='cashFlowControl' >0</field><field name='accountsArch' eval='accountsarch_1' /></record>
-
-
+<!-- 特殊会计科目 -->
+<record id='special_accounts_1' model='accountcore.special_accounts'>
+<field name='name' >本年利润科目</field>
+<field name='purpos' >用于自动结转损益</field>
+<field name='children' >0</field>
+<field name='accounts' eval="[(6,0,[account_119])]" />
+</record>
+<record id='special_accounts_2' model='accountcore.special_accounts'>
+<field name='name' >利润分配科目</field>
+<field name='purpos' >用于自动结转损益</field>
+<field name='children' >0</field>
+<field name='accounts' eval="[(6,0,[account_120])]" />
+</record>
+<record id='special_accounts_3' model='accountcore.special_accounts'>
+<field name='name' >以前年度损益调整科目</field>
+<field name='purpos' >"以前年度损益调整科目",本年结转损益默认不包含该科目,不结转到"本年利润"科目.该科目应转入"利润分配---未分配利润"</field>
+<field name='children' >0</field>
+<field name='accounts' eval="[(6,0,[account_162])]" />
+</record>
     </data>
 </odoo>
