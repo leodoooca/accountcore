@@ -9,9 +9,12 @@ from odoo import models, fields, api
 import datetime
 import calendar
 import sys
-from odoo.tools.misc import profile
+import multiprocessing
 sys.path.append('.\\.\\server')
 _logger = logging.getLogger(__name__)
+
+# 新增,修改,删除凭证时对科目余额的改变加锁
+vocher_lock = multiprocessing.Lock()
 
 
 class Org(models.Model):
@@ -195,8 +198,12 @@ class Account(models.Model):
             [('account', '=', account_id),
              ('items', '=', old_accountItemClass_id)])
         if accountBalances.exists():
-            raise exceptions.ValidationError('该科目下的核算项目['+old_accountItemClass.name+'] \
+            if old_accountItemClass:
+                raise exceptions.ValidationError('该科目下的核算项目['+old_accountItemClass.name+'] \
                 已经使用,不能改变.你可以添加新的明细科目,在新的明细科目下设置你想要的核算项目类别')
+            else:
+                raise exceptions.ValidationError(
+                    '该科目已经使用,不能改变.你可以添加新的明细科目,在新的明细科目下设置你想要的核算项目类别')
 
     @api.onchange('itemClasses')
     def _checkItemClasses(self):
@@ -388,7 +395,8 @@ class Voucher(models.Model):
     @api.model
     def create(self, values):
         '''新增凭证'''
-
+        # 只允许一条分录更新余额表
+        vocher_lock.acquire()
         values['uniqueNumber'] = self.env['ir.sequence'].next_by_code(
             'voucher.uniqueNumber')
         rl = super(Voucher, self).create(values)
@@ -398,16 +406,23 @@ class Voucher(models.Model):
         else:
             rl._checkVoucher(values)
         rl._updateBalance()
+        # 跟新处理并发冲突
+        self.env.cr.commit()
+        vocher_lock.release()
         return rl
 
     @api.multi
     def write(self, values):
         '''修改编辑凭证'''
+        vocher_lock.acquire()
         self.ensure_one
         self._updateBalance(isAdd=False)  # 先从余额表减去原来的金额
         rl_bool = super(Voucher, self).write(values)
         self._checkVoucher(values)
         self._updateBalance()  # 再从余额表加上新的金额
+        # 跟新处理并发冲突
+        self.env.cr.commit()
+        vocher_lock.release()
         return rl_bool
 
     @api.multi
@@ -421,6 +436,7 @@ class Voucher(models.Model):
         rl = super(Voucher, self.with_context(
             {'ac_from_copy': True})).copy(updateFields)
         for entry in self.entrys:
+            # entry.copy({'voucher': rl.id, 'updata_balance': False})
             entry.copy({'voucher': rl.id})
         rl._updateBalance()
         return rl
@@ -428,9 +444,13 @@ class Voucher(models.Model):
     @api.multi
     def unlink(self):
         '''删除凭证'''
+        vocher_lock.acquire()
         for voucher in self:
             voucher._updateBalance(isAdd=False)
         rl_bool = super(Voucher, self).unlink()
+        # 跟新处理并发冲突
+        self.env.cr.commit()
+        vocher_lock.release()
         return rl_bool
 
     @staticmethod
@@ -568,6 +588,19 @@ class Voucher(models.Model):
                ('numberTasticsContainer_str', 'like', tasticsValue2)]
 
     @api.model
+    def _checkRequiredItemClass(self):
+        entrys = self.entrys
+        for entry in entrys:
+            itemClass_need = entry.account.accountItemClass
+            if itemClass_need.id:
+                items = entry.items
+                itemsClasses_ids = [item.itemClass.id for item in items]
+                if itemClass_need.id not in itemsClasses_ids:
+                    raise exceptions.ValidationError(
+                        entry.account.name+" 科目的 "+itemClass_need.name+' 为必须录入项目')
+        return True
+
+    @api.model
     def _updateBalance(self, isAdd=True):
         '''更新余额'''
         for entry in self.entrys:
@@ -698,19 +731,6 @@ class Voucher(models.Model):
                                       ['isbegining', '=', False]])
         return record
 
-    @api.model
-    def _checkRequiredItemClass(self):
-        entrys = self.entrys
-        for entry in entrys:
-            itemClass_need = entry.account.accountItemClass
-            if itemClass_need.id:
-                items = entry.items
-                itemsClasses_ids = [item.itemClass.id for item in items]
-                if itemClass_need.id not in itemsClasses_ids:
-                    raise exceptions.ValidationError(
-                        entry.account.name+" 科目的 "+itemClass_need.name+' 为必须录入项目')
-        return True
-
 
 class Enty(models.Model):
     '''一条分录'''
@@ -721,6 +741,9 @@ class Enty(models.Model):
                               index=True,
                               ondelete='cascade')
     org = fields.Many2one(related="voucher.org", store=True, string="核算机构")
+    v_year = fields.Integer(related="voucher.year", store=True, string="年")
+    v_month = fields.Integer(related="voucher.month", store=True, string="月")
+    updata_balance = fields.Boolean(string='是否更新科目余额', default=False)
     sequence = fields.Integer('Sequence')
     explain = fields.Char(string='说明')
     account = fields.Many2one(
@@ -1069,10 +1092,10 @@ class AccountsBalance(models.Model):
     createDate = fields.Date(
         string="创建日期", required=True)
     # 通过createDate生成,不要直接修改
-    year = fields.Integer(string='年份', required=True,
+    year = fields.Integer(string='年', required=True,
                           index=True)
     # 通过createDate生成,不要直接修改
-    month = fields.Integer(string='月份', required=True)
+    month = fields.Integer(string='月', required=True)
     isbegining = fields.Boolean(string="是启用期间", default=False)
     account = fields.Many2one('accountcore.account',
                               string='会计科目',
@@ -1105,6 +1128,7 @@ class AccountsBalance(models.Model):
                                         compute='getCumulativeCamount',
                                         store=True,
                                         default=0)
+
     beginCumulativeDamount = fields.Monetary(string='月初本年借方累计', default=0)
     beginCumulativeCamount = fields.Monetary(string='月初本年贷方累计', default=0)
     preRecord = fields.Many2one(
@@ -1194,8 +1218,8 @@ class AccountsBalance(models.Model):
                 oldSelf['camount'] = self.camount
                 oldSelf['endDamount'] = self.endDamount
                 oldSelf['endCamount'] = self.endCamount
-                oldSelf['cumulativeDamount'] = self.beginCumulativeDamount
-                oldSelf['cumulativeCamount'] = self.beginCumulativeCamount
+                oldSelf['cumulativeDamount'] = self.beginCumulativeDamount+self.damount
+                oldSelf['cumulativeCamount'] = self.beginCumulativeCamount+self.camount
                 oldSelf['beginCumulativeDamount'] = self.beginCumulativeDamount
                 oldSelf['beginCumulativeCamount'] = self.beginCumulativeCamount
                 oldSelf['preRecord'] = None
@@ -1326,44 +1350,49 @@ class AccountsBalance(models.Model):
             return
 
     @api.multi
-    @api.depends('beginingDamount', 'damount')
+    @api.depends('beginCumulativeDamount', 'damount')
     def getEndingBalance_D(self):
         '''计算期末贷方余额'''
         for record in self:
             record.endDamount = record.beginingDamount+record.damount
         return True
 
-    @api.depends('beginingDamount', 'damount')
+    @api.depends('beginCumulativeDamount', 'damount')
     def getCumulativeDamount(self):
         '''计算本年借方累计发生额'''
         # 机构科目项目在本年内1月到本月的余额记录
+        # 如果是改变启用期初,就不处理
+        if self.isbegining == True:
+            self.cumulativeDamount = self.beginCumulativeDamount+self.damount
+            return True
         records = self.search(
             [('year', '=', self.year),
-             ('month', "<=", self.month),
-             ('org', '=', self.org.id),
-             ('account', '=', self.account.id),
-             ('items', '=', self.items.id)])
-        # 对damount字段求和
+                ('month', "<=", self.month),
+                ('org', '=', self.org.id),
+                ('account', '=', self.account.id),
+                ('items', '=', self.items.id)])
         yearDamount = sum(records.mapped('damount'))
-        # 当年有启用期初,就需要加上启用期初的本年累计
         beginingRecord = records.filtered(lambda r: r.isbegining)
         if beginingRecord.exists():
             yearDamount = yearDamount+beginingRecord.beginCumulativeDamount
         self.cumulativeDamount = yearDamount
         return True
 
-    @api.depends('beginingCamount', 'camount')
+    @api.depends('beginCumulativeCamount', 'camount')
     def getCumulativeCamount(self):
         '''计算本年借方累计发生额'''
+        # 如果不是改变启用期初,就不处理
+        if self.isbegining == True:
+            self.cumulativeCamount = self.beginCumulativeCamount+self.camount
+            return True
         records = self.search(
             [('year', '=', self.year),
-             ('month', "<=", self.month),
-             ('org', '=', self.org.id),
-             ('account', '=', self.account.id),
-             ('items', '=', self.items.id)])
+                ('month', "<=", self.month),
+                ('org', '=', self.org.id),
+                ('account', '=', self.account.id),
+                ('items', '=', self.items.id)])
         # 对camount字段求和
         yearCamount = sum(records.mapped('camount'))
-        # 当年有启用期初,就需要加上启用期初的本年累计
         beginingRecord = records.filtered(lambda r: r.isbegining)
         if beginingRecord.exists():
             yearCamount = yearCamount+beginingRecord.beginCumulativeCamount
@@ -1463,6 +1492,96 @@ class AccountsBalance(models.Model):
             preBalances[-1].setNextBalance(self)
             self.changePreBalanceBegining(self.beginingDamount,
                                           self.beginingCamount)
+
+    def updata_balance(self):
+        '''根据会计分录定时更新余额表'''
+        # 获得要更新的会计分录
+        entrys = self.env['accountcore.entry'].sudo().search(
+            [('updata_balance', '=', False)])
+
+        for entry in entrys:
+            self._updateAccountBalance(entry)
+
+    # @api.model
+    # def _updateBalance(self, isAdd=True):
+    #     '''更新余额'''
+    #     for entry in self.entrys:
+    #         self._updateAccountBalance(entry, isAdd)
+
+    @api.model
+    def _updateAccountBalance(self, entry, isAdd=True):
+        '''新增和修改凭证，更新科目余额'''
+        item = entry.getItemByitemClass(entry.account.accountItemClass)
+        if item:
+            itemId = item.id
+        else:
+            itemId = False
+
+        if isAdd:
+            computMark = 1  # 增加金额
+        else:
+            computMark = -1  # 减少金额
+        entry_damount = entry.damount*computMark
+        entry_camount = entry.camount*computMark
+        accountBalanceTable = self.env['accountcore.accounts_balance']
+        accountBalanceMark = AccountBalanceMark(orgId=entry.org.id,
+                                                # accountId=entry.account.id,
+                                                accountId=entry.account.id,
+                                                itemId=itemId,
+                                                createDate=self.voucherdate,
+                                                accountBalanceTable=accountBalanceTable,
+                                                isbegining=False)
+        # if 一条会计分录有核算项目
+        if entry.items:
+            for item_ in entry.items:
+                accountBalance = self._getBalanceRecord(entry.account.id,
+                                                        item_.id)
+                # if 当月已经存在一条该科目的余额记录（不包括启用期初余额那条）
+                if accountBalance.exists():
+                    self._modifyBalance(entry_damount,
+                                        accountBalance,
+                                        entry_camount)
+                # else 不存在就新增一条,但必须是科目的必选核算项目类
+                elif item_.id == itemId:
+                    self._buildBalance(True,
+                                       accountBalanceMark,
+                                       entry,
+                                       entry_damount,
+                                       entry_camount)
+        # else 一条会计分录没有核算项目
+        else:
+            accountBalance = self._getBalanceRecord(entry.account.id)
+            # if 当月已经存在一条该科目的余额记录（不包括启用期初余额那条）
+            if accountBalance.exists():
+                self._modifyBalance(entry_damount,
+                                    accountBalance,
+                                    entry_camount)
+            # else 不存在就新增一条
+            else:
+                # 不排除启用期初那条记录
+                self._buildBalance(False,
+                                   accountBalanceMark,
+                                   entry,
+                                   entry_damount,
+                                   entry_camount)
+
+        return True
+
+    @api.model
+    # def _getBalanceRecord(self, accountId, itemId=False):
+    def _getBalanceRecord(self, entry, itemId=False):
+        '''获得分录对应期间和会计科目下的核算项目的余额记录，排除启用期初那条记录'''
+        balanasTable = self.env['accountcore.accounts_balance']
+        org = entry.org.id
+        year = entry.v_year
+        month = entry.v_month
+        record = balanasTable.search([['org', '=', org],
+                                      ['year', '=', year],
+                                      ['month', '=', month],
+                                      ['account', '=', entry.account.id],
+                                      ['items', '=', itemId],
+                                      ['isbegining', '=', False]])
+        return record
 
 
 class AccountBalanceMark(object):
@@ -1650,7 +1769,6 @@ class Period(object):
         self.start_month = self.start_date.month
         self.end_month = self.end_date.month
 
-    @profile('C:\\prof.profile')
     def getPeriodList(self):
         '''获得日期范围内的会计期间列表'''
 
@@ -1783,7 +1901,7 @@ class currencyDown_sunyi(models.TransientModel):
                 if endAmount != 0:
                     entrys_value.append({"explain": '结转损益',
                                          "account": b.account.id,
-                                         "items": b.items.id,
+                                         "items": [(6, 0, [b.items.id])],
                                          "camount": endAmount
                                          })
                     sum_d = sum_d+endAmount
@@ -1791,7 +1909,7 @@ class currencyDown_sunyi(models.TransientModel):
                 if endAmount != 0:
                     entrys_value.append({"explain": '结转损益',
                                          "account": b.account.id,
-                                         "items": b.items.id,
+                                         "items": [(6, 0, [b.items.id])],
                                          "damount": -endAmount
                                          })
                     sum_c = sum_c+endAmount
@@ -1812,7 +1930,6 @@ class currencyDown_sunyi(models.TransientModel):
         if len(entrys_value) < 2:
             return None
         entrys = self.t_entry.sudo().create(entrys_value)
-
         voucher = self.env['accountcore.voucher'].sudo().create({
             'voucherdate': voucer_period.endDate,
             'org': org.id,
