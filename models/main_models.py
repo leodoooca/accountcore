@@ -31,6 +31,7 @@ class GlobTagClass(models.Model):
     _description = '全局标签类别'
     number = fields.Char(string='全局标签类别编码')
     name = fields.Char(string='全局标签类别名称', required=True)
+    summary = fields.Char(string='使用范围和简介')
     _sql_constraints = [('accountcore_itemclass_number_unique', 'unique(number)',
                          '全局标签类别编码重复了!'),
                         ('accountcore_itemclass_name_unique', 'unique(name)',
@@ -449,7 +450,7 @@ class Account(models.Model, Glob_tag_Model):
         if org:
             domain.append(('org', '=', org.id))
         else:
-            domain.append('org', '=', False)
+            domain.append(('org', '=', False))
         account_balances = self.env["accountcore.accounts_balance"].sudo().search(
             domain)
         return account_balances
@@ -458,6 +459,14 @@ class Account(models.Model, Glob_tag_Model):
         '''获得启用期初的记录'''
         rs = self.getBalances(org, item)
         rs.filtered(lambda r: r.isbegining)
+        if len(rs) == 0:
+            return None
+        return rs
+
+    def getBlanceOf(self, year, month, org=None, item=None):
+        '''获得指定月份的余额记录'''
+        rs = self.getBalances(org, item)
+        rs.filtered(lambda r: r.year == year and r.month == month)
         if len(rs) == 0:
             return None
         return rs
@@ -515,9 +524,8 @@ class Account(models.Model, Glob_tag_Model):
         items = rs_org.mapped('items')
         return items
 
+
 # 特殊的会计科目
-
-
 class SpecialAccounts(models.Model):
     '''特殊的会计科目'''
     _name = "accountcore.special_accounts"
@@ -637,7 +645,7 @@ class Voucher(models.Model):
     voucherdate = fields.Date(string='记账日期',
                               required=True,
                               placeholder='记账日期')
-    real_date = fields.Date(string='业务日期', placehplder='业务日期')
+    real_date = fields.Date(string='业务日期', help='业务实际发生日期')
     # 前端通过voucherDate生成,不要直接修改
     year = fields.Integer(string='年份',
                           compute='getYearMonth',
@@ -666,7 +674,9 @@ class Voucher(models.Model):
                                 help='可用于标记不同的凭证',
                                 ondelete='restrict')
     number = fields.Integer(string='凭证编号',
-                            help='该编号更据不同凭证编号策略会不同,一张凭证可以有多个不同编号',
+                            help='''该编号更据不同凭证编号策略会不同,
+                            一张凭证可以有多个不同编号.可在查询凭证界面批量自动编号.
+                            和原始凭证对应可另用唯一编号''',
                             compute='getVoucherNumber',
                             search="searchNumber")
     appendixCount = fields.Integer(string='附件张数',
@@ -1154,9 +1164,9 @@ class Enty(models.Model):
                           store=True,
                           string="核算机构")
     v_voucherdate = fields.Date(related="voucher.voucherdate",
-                              store=True,
-                              string="记账日期",
-                              index=True)
+                                store=True,
+                                string="记账日期",
+                                index=True)
     v_real_date = fields.Date(related="voucher.real_date",
                               store=True,
                               string="业务日期",
@@ -1197,7 +1207,7 @@ class Enty(models.Model):
                                index=True,
                                ondelete='restrict')
     # 必录的核算项目
-    account_item = fields.Many2one('accountcore.item',string='*核算项目',
+    account_item = fields.Many2one('accountcore.item', string='*核算项目',
                                    compute="_getAccountItem",
                                    store=True,
                                    index=True)
@@ -1271,11 +1281,10 @@ class Enty(models.Model):
         '''返回分录中指定类别的核算项目'''
         return self.getItemByitemClassId(itemClass.id)
 
-
     def show_voucher(self):
         '''分录列表关联查看凭证'''
         return {
-            'name':"",
+            'name': "",
             'type': 'ir.actions.act_window',
             'res_model': 'accountcore.voucher',
             'view_type': 'form',
@@ -1284,6 +1293,8 @@ class Enty(models.Model):
             'target': 'new',
         }
 # 凭证编号策略
+
+
 class VoucherNumberTastics(models.Model):
     '''凭证编号的生成策略,一张凭证在不同的策略下有不同的凭证编号,自动生成凭证编号时需要指定一个策略'''
     _name = 'accountcore.voucher_number_tastics'
@@ -1878,8 +1889,6 @@ class AccountsBalance(models.Model):
 
 
 # 科目余额用对象
-
-
 class AccountBalanceMark(object):
     def __init__(self, orgId, accountId, itemId, createDate, accountBalanceTable, isbegining):
         self.org = orgId
@@ -1934,23 +1943,3 @@ class AccountBalanceMark(object):
         return next_balanceRecords
 
 
-# 帮助的类别
-class HelpClass(models.Model):
-    '''帮助类别'''
-    _name = 'accountcore.help_class'
-    _description = '帮助类别'
-    name = fields.Char(string='帮助类别', required=True)
-    _sql_constraints = [('accountcore_help_class_name_unique', 'unique(name)',
-                         '帮助类别名称重复了!')]
-
-
-# 帮助
-class Helpes(models.Model):
-    '''详细帮助'''
-    _name = 'accountcore.helps'
-    _description = '详细帮助'
-    name = fields.Char(string='标题', required=True)
-    help_class = fields.Many2one('accountcore.help_class',
-                                 string='帮助类别',
-                                 required=True)
-    content = fields.Html(string='内容')

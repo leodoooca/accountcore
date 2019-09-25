@@ -677,6 +677,8 @@
               <field name='real_date' col='2' attrs="{'readonly':[('state','=','reviewed')]}" />
               <field name='number' col='2' readonly='1' attrs="{'readonly':[('state','=','reviewed')]}" />
               <field name='ruleBook' col='2' options="{'no_create_edit':0,'no_create':0,'no_open':0}" widget="many2many_tags" />
+              <field name='uniqueNumber' col='2' readonly='1'></field>
+
             </group>
             <field name='entrys' context="{'disable_open':True}" attrs="{'readonly':[('state','=','reviewed')]}">
               <tree editable="bottom" class='oe_ac_voucher_entrys' options="{'no_open':1}" col='6' limit='80'>
@@ -701,7 +703,6 @@
               <span id="auto_balance" style="margin-left:5px">自动平衡</span>
             </div>
             <group col='8' class='oe_grey'>
-              <field name='uniqueNumber' readonly='1'></field>
               <field name='soucre' />
               <field name='createUser' />
               <field name='reviewer' />
@@ -721,9 +722,9 @@
       <field name='name'>会计分录列表</field>
       <field name='model'>accountcore.entry</field>
       <field name='arch' type='xml'>
-        <tree  class='oe_accountcore_table_fix' create='false' edit='false' delete='false' default_order='org,v_voucherdate,voucher'>
+        <tree class='oe_accountcore_table_fix' create='false' edit='false' delete='false'  default_order='org,v_voucherdate,voucher'>
           <button type='object' class="btn btn-sm fa fa-reply" name='show_voucher'></button>
-          <field name='org' ></field>
+          <field name='org'></field>
           <field name="v_voucherdate" />
           <field name="v_year" invisible='1' />
           <field name="v_month" invisible='1' />
@@ -740,25 +741,25 @@
     </record>
     <!-- pivots 分录透视- -->
     <record id="accountcore_entry_pivots" model='ir.ui.view'>
-    <field name="name">分录透视</field>
-    <field name='model'>accountcore.entry</field>
-    <field name='arch' type='xml'>
-    <pivot string="" >
-          <field name='org'  type='col'></field>
+      <field name="name">分录透视</field>
+      <field name='model'>accountcore.entry</field>
+      <field name='arch' type='xml'>
+        <pivot string="">
+          <field name='org' type='col'></field>
           <field name="v_voucherdate" />
           <field name="v_year" invisible='1' />
           <field name="v_month" invisible='1' />
-          <field name="voucher" invisible='1'/>
-          <field name="explain"  invisible='1'/>
+          <field name="voucher" invisible='1' />
+          <field name="explain" invisible='1' />
           <field name="account" />
-          <field name="damount" type="measure"/>
-          <field name="camount" type="measure"/>
-          <field name="items"  />
-          <field name="cashFlow" type='row'/>
+          <field name="damount" type="measure" />
+          <field name="camount" type="measure" />
+          <field name="items" />
+          <field name="cashFlow" type='row' />
           <field name="v_real_date" />
-          <field name="updata_balance" invisible='1'/>
-     </pivot>
-    </field>
+          <field name="updata_balance" invisible='1' />
+        </pivot>
+      </field>
     </record>
     <!-- form-会计分录 -->
     <record id="accountcore_entry_form" model="ir.ui.view">
@@ -969,12 +970,12 @@
               <field name="includeAccountItems" />
             </group>
             <group>
-              <field name="org" widget="many2many_checkboxes_floatleft" />
+              <field name="orgs" widget="many2many_checkboxes_floatleft" />
               <field name="order_orgs" />
               <field name="sum_orgs" />
             </group>
             <group>
-              <field name="account" default_focus='1' domain="['|',('org','in',org),('org','=',False)]" context="{'search_default_group_by_accountClassClass':True}">
+              <field name="account" default_focus='1' domain="['|',('org','in',orgs),('org','=',False)]" context="{'search_default_group_by_accountClassClass':True}">
                 <tree default_order='accountClass,number,org' >
                   <field name='org' />
                   <field name='accountClass' />
@@ -1033,7 +1034,7 @@
         <form >
           <sheet>
             <group>
-              <field name="startDate" editable='0' />
+              <field name="startDate" />
               <field name="endDate" />
               <field name="fast_period" widget="ac_fast_period" />
             </group>
@@ -1057,6 +1058,7 @@
           <field name="number" string="科目编号包含" domain="[('number','ilike', self)]" />
           <field name="glob_tag" string="全局标签包含" domain="[('glob_tagr','ilike', self)]" widget='many2one' />
           <filter string="一级科目" name="leve_1" domain="[('fatherAccountId','=',False)]"></filter>
+          <filter string="非一级科目" name="leve_2" domain="[('fatherAccountId','!=',False)]"></filter>
           <filter string="分配现金流量的科目" name="chash_flow_y" domain="[('cashFlowControl','=',True)]"></filter>
           <filter name="group_by_accountClassClass" string="按科目类别分组" context = "{'group_by': 'accountClass'}" />
           <filter name="group_by_arch" string="按科目体系分组" context = "{'group_by': 'accountsArch'}" />
@@ -1227,29 +1229,29 @@
     <record model='ir.actions.act_window' id='accountcore_entrys_action_window'>
       <field name='name'>分录列表</field>
       <field name='res_model'>accountcore.entry</field>
-      <field name='view_mode'>tree,form,pivot</field>
+      <field name='view_mode'>tree,pivot</field>
       <field name="context">{'search_default_this_month': 1}</field>
     </record>
     <!-- 窗体动作-打开特殊科目列表 -->
-    <record model="ir.actions.act_window" id="acccountcore_special_accounts_actions_window">
+    <record model="ir.actions.act_window" id="accountcore_special_accounts_actions_window">
       <field name="name">特殊科目列表</field>
       <field name="res_model">accountcore.special_accounts</field>
       <field name='view_mode'>tree,form</field>
     </record>
     <!-- 窗体动作-打开全局标签类别列表 -->
-    <record model="ir.actions.act_window" id="acccountcore_glob_tag_class_actions_window">
+    <record model="ir.actions.act_window" id="accountcore_glob_tag_class_actions_window">
       <field name="name">全局标签类别列表</field>
       <field name="res_model">accountcore.glob_tag_class</field>
       <field name='view_mode'>tree,form</field>
     </record>
     <!-- 窗体动作-打开全局标签列表 -->
-    <record model="ir.actions.act_window" id="acccountcore_glob_tag_actions_window">
+    <record model="ir.actions.act_window" id="accountcore_glob_tag_actions_window">
       <field name="name">全局标签列表</field>
       <field name="res_model">accountcore.glob_tag</field>
       <field name='view_mode'>tree,form</field>
     </record>
     <!-- 窗体动作-打开帮助列表 -->
-    <record model="ir.actions.act_window" id="acccountcore_helps_actions_window">
+    <record model="ir.actions.act_window" id="accountcore_helps_actions_window">
       <field name="name">帮助列表</field>
       <field name="res_model">accountcore.helps</field>
       <field name='view_mode'>tree,form</field>
@@ -1315,7 +1317,7 @@
       <field name="dpi">90</field>
     </record>
     <!-- 窗体动作-打开科目启用期初余额 -->
-    <record model='ir.actions.act_window' id='acccountcore_accounts_balance_actions_window'>
+    <record model='ir.actions.act_window' id='accountcore_accounts_balance_actions_window'>
       <field name="name">科目启用期初余额</field>
       <field name="res_model">accountcore.accounts_balance</field>
       <field name="view_mode">tree,form</field>
@@ -1356,27 +1358,6 @@
       <field name="name">平衡检查</field>
       <field name='res_model'>accountcore.begin_balance_check</field>
       <field name='view_mode'>form</field>
-    </record>
-
-  </data>
-  <!-- 记账凭证唯一编号 -->
-  <data noupdate='True'>
-    <record id='voucher_unique_number' model='ir.sequence'>
-      <field name='name'>记账凭证唯一号</field>
-      <field name='code'>voucher.uniqueNumber</field>
-      <field name='prefix'>V</field>
-      <field name='suffix'></field>
-      <field name='padding'>6</field>
-    </record>
-  </data>
-  <!-- 核算项目唯一编号 -->
-  <data noupdate='True'>
-    <record id='item_unique_number' model='ir.sequence'>
-      <field name='name'>核算项目唯一号</field>
-      <field name='code'>item.uniqueNumber</field>
-      <field name='prefix'>I</field>
-      <field name='suffix'></field>
-      <field name='padding'>8</field>
     </record>
   </data>
 </odoo>
