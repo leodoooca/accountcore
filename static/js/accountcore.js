@@ -176,6 +176,8 @@ odoo.define('web.accountcoreExtend', ['web.basic_fields', 'web.relational_fields
 
     var FieldMany2ManyCheckBoxes = relational_fields.FieldMany2ManyCheckBoxes;
     var FieldMany2ManyCheckBoxes_flowToLeft = FieldMany2ManyCheckBoxes.extend({
+
+
         template: 'FieldMany2ManyCheckBoxes_flowToLeft',
     });
     var fieldRegistry = require('web.field_registry');
@@ -590,7 +592,7 @@ odoo.define('accountcore.balanceListView', function (require) {
 odoo.define("accountcore.begin_balance_check", function (require) {
     "use strict";
     var Widget = require('web.Widget');
-    var framework = require('web.framework');
+    // var framework = require('web.framework');
     var CheckBalance = Widget.extend({
         template: 'accountcore.check_balance',
         events: {
@@ -836,5 +838,842 @@ odoo.define('accountcore.period_tool', function (require) {
         'VoucherPeriod': VoucherPeriod,
         'PeriodScop': PeriodScop,
         'Period': Period,
+    };
+});
+// 自定义按钮
+odoo.define('accountcore.btn', ['web.AbstractField', 'web.field_registry'], function (require) {
+    "use strict";
+    var AbstractField = require('web.AbstractField');
+    // 点击按钮触发后台@api.onchage('本字段')装饰的方法
+    var opetions = {
+        forceChange: true
+    };
+    var ac_btn_trigger_onchange = AbstractField.extend({
+        events: _.extend({
+            'click': '_btn_click',
+
+        }, AbstractField.prototype.events, {}),
+        supportedFieldTypes: ['char'],
+        template: 'accountcor.ac_btn',
+        start: function () {
+            this.$el.find('span').text(this.string);
+            this.$el.addClass(this.attrs.class);
+            this._super.apply(this, arguments);
+        },
+        _btn_click: function () {
+
+            this._setValue('1', opetions);
+        },
+    });
+    var fieldRegistry = require('web.field_registry');
+    fieldRegistry.add('ac_btn_trigger_onchange', ac_btn_trigger_onchange);
+    return {
+        ac_btn_trigger_onchange: ac_btn_trigger_onchange,
+    };
+});
+// 报表设计器相关
+odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 'accountcore.jexcel', 'accountcore.jsuites', 'web.core', 'web.AbstractAction', 'web.session', 'web.framework'], function (require) {
+    "use strict";
+    var AbstractField = require('web.AbstractField');
+    var jexcel = require('accountcore.jexcel');
+    var core = require('web.core');
+    var AbstractAction = require('web.AbstractAction');
+    var framework = require('web.framework');
+    // 公式类
+    class ACFormula {
+        constructor(cellstr) {
+            if (!cellstr) {
+                throw Error("公式错误,没有内容");
+            }
+            if (cellstr.charAt(0) != '=') {
+                throw Error("公式错误，没有以=开头");
+            }
+            if (cellstr.slice(-2) != '")') {
+                throw Error("公式错误，没有以\")结尾");
+            }
+            this.str = cellstr;
+            this.index1 = this.str.indexOf('("');
+            if (this.index1 == -1) {
+                throw Error("公式错误，没有'(\"'");
+            }
+            this.index2 = this.str.lastIndexOf('")');
+        }
+        /**
+         * 公式名称
+         */
+        name() {
+            var name = this.str.slice(1, this.index1);
+            if (name.length == 0) {
+                throw Error("公式错误，在'=' 和'(\"='之间没有公式名称");
+            }
+            return name;
+        }
+        /**
+         * 公式内容
+         */
+        value() {
+            return this.str.slice(this.index1 + 2, -2);
+        }
+    }
+    // 表格设计器表格的数据字段小部件
+    var ac_jexcel = AbstractField.extend({
+        events: _.extend({
+            '.jexcel td click': '_do_check',
+
+        }, AbstractField.prototype.events, {}),
+        supportedFieldTypes: ['text'],
+        template: 'ac_jexcel',
+        // 选中的单元格
+        selection_x1: 0,
+        selection_y1: 0,
+        selection_x2: 0,
+        //右下角单元格
+        selection_y2: 0,
+        // 左上角单元格
+        cellName_ul: "A1",
+        cellName_lr: "A1",
+        startDate: '',
+        endDate: '',
+        orgIds: '',
+        computingStep: 0,
+        _do_check: function () {
+            alert('check');
+            var cellName = jexcel.getColumnNameFromId([this.selection_x1, this.selection_y1]);
+            alert(JSON.stringify(this.jexcel_obj.getMeta(cellName)));
+            alert(JSON.stringify(this.jexcel_obj.getMeta(cellName, "ac")));
+        },
+        start: function () {
+            core.bus.on('ac_jexcel_set_formula', this, this._onSet_formula);
+            return this._super.apply(this, arguments);
+        },
+        /**
+         * 获得供报表的公式计算的开始期间参数
+         */
+        _getStartDate: function () {
+            var startDate = $("[name='startDate'] input").val()
+            // 非编辑状态下取数
+            if (!startDate) {
+                startDate = $("[name='startDate']").text()
+            }
+            return this._changeDateStr(startDate);
+        },
+        /**
+         * 获得供报表的公式计算的结束期间参数
+         */
+        _getEndDate: function () {
+            var endDate = $("[name='endDate'] input").val()
+            if (!endDate) {
+                endDate = $("[name='endDate']").text()
+            }
+            return this._changeDateStr(endDate);
+        },
+        /**
+         * 获得供报表公式计算的机构范围参数
+         */
+        _getOrgIds: function () {
+            var ids = _.map($(".ac_choice_orgs").find('input:checked'), function (input) {
+                return $(input).data("record-id");
+            });
+            return ids.join('/');
+        },
+        // 设置公式
+        _onSet_formula: function (v) {
+            var formula = "";
+            if (v) {
+                var formula = '=ac("' + v + '")';
+            };
+            var cellName = jexcel.getColumnNameFromId([this.selection_x1, this.selection_y1]);
+            this.jexcel_obj.setMeta(cellName, 'ac', formula);
+            this.jexcel_obj.setValueFromCoords(this.selection_x1, this.selection_y1, formula);
+            this.jexcel_obj.updateSelectionFromCoords(this.selection_x1, this.selection_y1, this.selection_x1, this.selection_y1);
+        },
+        //判断是不是公式，"="开头
+        _isACFormula: function (str) {
+            if (!str) {
+                return false;
+            }
+            if (str.slice(0, 3) == '=ac') {
+                return true;
+            }
+
+        },
+        // 触发更新表格单元格数据，样式和批注
+        _changeStyleAndData: function (instance) {
+            if (this.mode != 'edit') {
+                return;
+            }
+            this._setValue(JSON.stringify(instance.jexcel.getData()));
+            core.bus.trigger('ac_jexcel_style_change', instance.jexcel.getStyle());
+            core.bus.trigger('ac_jexcel_merge_change', instance.jexcel.getMerge());
+            core.bus.trigger('ac_jexcel_width_change', self._getWidths(instance));
+            core.bus.trigger('ac_jexcel_height_change', self._getHeights(instance));
+            core.bus.trigger('ac_jexcel_comments_change', this._getComments(instance));
+            core.bus.trigger('ac_jexcel_meta_change', self._getMetas(instance));
+        },
+        // 获得表格批注信息
+        _getComments: function (instance) {
+            return self._getAllCellsInfo(instance.jexcel, 'getComments')
+        },
+        _getFomulas: function (jexcel) {
+
+        },
+
+        /**
+         * @description 获得表格各列宽
+         * @param  {} instance
+         */
+        _getWidths: function (instance) {
+            var values = {};
+            var je = instance.jexcel
+            var length = je.colgroup.length;
+            var widths = je["getWidth"]();
+            for (var l = 0; l < length; l++) {
+                values[l] = widths[l];
+            };
+            return values;
+        },
+        /**
+         * @description 获得表格各行高
+         * @param  {} instance
+         */
+        _getHeights: function (instance) {
+            var values = {};
+            var je = instance.jexcel
+            var length = je.rows.length;
+            var heights = je["getHeight"]();
+            for (var l = 0; l < length; l++) {
+                if (heights[l] > 0) {
+                    values[l] = heights[l]
+                } else {
+                    values[l] = je.options.defaultRowsHeight;
+                };
+            };
+            return values;
+        },
+        /**
+         * @description 获得表格单元格的meta数据，公式等
+         * @param  {} instance
+         */
+        _getMetas: function (instance) {
+            var values = {};
+            var je = instance.jexcel
+            var rowsCount = je.rows.length;
+            var colsCount = je.colgroup.length;
+            var callName;
+            for (var y = 0; y < rowsCount; y++) {
+                for (var x = 0; x < colsCount; x++) {
+                    callName = jexcel.getColumnNameFromId([x, y]);
+                    if (je.getMeta(callName)) {
+                        values[callName] = je.getMeta(callName);
+                    }
+                }
+            };
+            return values;
+        },
+        /**
+         * @description 获得表格全部单元的指定信息，如批注，公式等
+         * @param  {} jexcel
+         * @param  {} fncName
+         */
+        _getAllCellsInfo: function (instance, fncName) {
+            var values = {};
+            var x = instance.rows.length;
+            var y = instance.colgroup.length;
+            var v;
+            for (var j = 0; j < y; j++) {
+                for (var i = 0; i < x; i++) {
+                    v = instance[fncName]([j, i]);
+                    if (v.length > 0) {
+                        var cellName = jexcel.getColumnNameFromId([j, i]);
+                        values[cellName] = v;
+                    }
+                };
+            };
+            return values;
+        },
+        /**
+         * @description 更新选中单元格的字符串格式，如"A1"
+         * @param  {} x1 左上角x坐标               
+         * @param  {} y1 左上角y坐标
+         * @param  {} x2 右下角x坐标
+         * @param  {} y2 右下角y坐标
+         */
+        _setSelectionCells: function (x1, y1, x2, y2) {
+            self.selection_x1 = x1;
+            self.selection_y1 = y1;
+            self.selection_x2 = x2;
+            self.selection_y2 = y2;
+            self.cellName_ul = jexcel.getColumnNameFromId([x1, y1]);
+            self.cellName_lr = jexcel.getColumnNameFromId([x2, y2]);
+        },
+        _isAutoComputing: function () {
+            return false;
+        },
+        _compute: function () {
+            var x = self.jexcel_obj.rows.length;
+            var y = self.jexcel_obj.colgroup.length;
+            var v;
+            for (var j = 0; j < y; j++) {
+                for (var i = 0; i < x; i++) {
+                    v = self.jexcel_obj.getValueFromCoords(j, i);
+                    if (v && v.charAt(0) == '=') {
+                        self.jexcel_obj.setValueFromCoords(j, i, v, false)
+                    }
+                }
+            }
+
+        },
+        _changeDateStr: function (dateStr) {
+            return dateStr.replace('年', '-').replace('月', '-').replace('日', '')
+
+        },
+        _renderEdit: function () {
+            self = this;
+            //避免重复加载
+            if (this.ddom) {
+                return;
+            };
+            this.ddom = document.createElement('div');
+            this.$el.append(this.ddom);
+            // var d = self.value;
+            var options = {
+                editable: (this.mode === 'edit'),
+                fullscreen: false,
+                defaultColWidth: 150,
+                wordWrap: true,
+                minDimensions: [4, 5],
+                rowResize: true,
+                columnResize: true,
+                allowComments: (this.mode === 'edit'),
+                columnDrag: (this.mode === 'edit'),
+                allowInsertRow: (this.mode === 'edit'),
+                allowManualInsertRow: (this.mode === 'edit'),
+                allowInsertColumn: (this.mode === 'edit'),
+                allowManualInsertColumn: (this.mode === 'edit'),
+                selectionCopy: (this.mode === 'edit'),
+                allowDeleteRow: (this.mode === 'edit'),
+                allowDeleteColumn: (this.mode === 'edit'),
+                // 不适用，有bug
+                allowRenameColumn: false,
+                // 排序和odoo可能有冲突，所以禁用
+                columnSorting: false,
+                data: $.parseJSON(self.value),
+                mergeCells: $.parseJSON(self.record.data['merge_info']),
+                // 自定义扩展option
+                computing: this._isAutoComputing(),
+                // 远程调用
+                widget: this,
+                // mergeCells:{},
+                // 工具栏
+                toolbar: [{
+                        type: 'i',
+                        content: 'undo',
+                        onclick: function () {
+                            self.jexcel_obj.undo();
+                            if (self.mode != 'edit') {
+                                return;
+                            }
+
+                        }
+                    },
+                    {
+                        type: 'i',
+                        content: 'redo',
+                        onclick: function () {
+                            self.jexcel_obj.redo();
+                            if (self.mode != 'edit') {
+                                return;
+                            }
+
+                        }
+                    },
+                    {
+                        type: 'select',
+                        k: 'font-family',
+                        v: ['Arial', 'Verdana']
+                    },
+                    {
+                        type: 'select',
+                        k: 'font-size',
+                        v: ['9px', '10px', '11px', '12px', '14px', '16px', '18px', '20px', '24px', '28px', '32px', '40px', '48px', '64px', '80px', ]
+                    },
+                    {
+                        type: 'i',
+                        content: 'format_align_left',
+                        k: 'text-align',
+                        v: 'left'
+                    },
+                    {
+                        type: 'i',
+                        content: 'format_align_center',
+                        k: 'text-align',
+                        v: 'center'
+                    },
+                    {
+                        type: 'i',
+                        content: 'format_align_right',
+                        k: 'text-align',
+                        v: 'right'
+                    },
+                    {
+                        type: 'i',
+                        content: 'format_bold',
+                        k: 'font-weight',
+                        v: 'bold'
+                    },
+                    {
+                        type: 'color',
+                        content: 'format_color_text',
+                        k: 'color'
+                    },
+                    {
+                        type: 'color',
+                        content: 'format_color_fill',
+                        k: 'background-color'
+                    },
+                    // 合并单元格
+                    {
+                        type: 'i',
+                        content: 'view_stream',
+                        onclick: function () {
+                            if (self.mode != 'edit') {
+                                return;
+                            }
+                            // var cell = jexcel.getColumnNameFromId([self.selection_x1, self.selection_y1])
+                            var x = self.selection_x2 - self.selection_x1;
+                            var y = self.selection_y2 - self.selection_y1;
+                            self.jexcel_obj.setMerge("", x, y);
+
+                        },
+                    },
+                    // 取消合并单元格
+                    {
+                        type: 'i',
+                        content: 'view_module',
+                        onclick: function () {
+                            if (self.mode != 'edit') {
+                                return;
+                            }
+                            var cell = jexcel.getColumnNameFromId([self.selection_x1, self.selection_y1]);
+                            self.jexcel_obj.removeMerge(cell);
+
+                        }
+                    },
+                    // 公式向导
+                    {
+                        type: 'i',
+                        content: 'open_with',
+                        onclick: function () {
+                            if (self.mode != 'edit') {
+                                return;
+                            }
+                            self._openAccountFormulaWizard();
+                        }
+                    },
+                    // 下载表格为csv
+                    {
+                        type: 'i',
+                        content: 'save_alt',
+                        onclick: function () {
+                            // self._do_check();
+                            self.jexcel_obj.download();
+                            // jexcel.current.options.computing=false;
+
+                        }
+                    },
+                    // 归档
+                    {
+                        type: 'i',
+                        content: 'save',
+                        onclick: function () {
+                            self.do_action({
+                                name: '报表归档向导',
+                                type: 'ir.actions.act_window',
+                                res_model: 'accountcore.store_report',
+                                context: {
+                                    default_name:self.record.data['name'],
+                                    model_id:self.res_id,
+                                },
+                                views: [
+                                    [false, 'form']
+                                ],
+                                target: 'new'
+                            })
+                        }
+                    },
+                    // 计算
+                    {
+                        type: 'i',
+                        content: 'exposure',
+                        onclick: function () {
+                            var startDate = self._getStartDate()
+                            var endDate = self._getEndDate()
+                            if (isNaN(startDate) && !isNaN(Date.parse(startDate)) &&
+                                isNaN(endDate) && !isNaN(Date.parse(endDate))) {
+                                if (Date.parse(startDate) > Date.parse(endDate)) {
+                                    self.do_warn("开始日期不能晚于结束日期!")
+                                    return
+                                }
+                                jexcel.current.options.computing = !jexcel.current.options.computing;
+                                self.startDate = startDate;
+                                self.endDate = endDate;
+                                self.orgIds = self._getOrgIds();
+                                self._compute();
+                            } else {
+                                self.do_warn("期间不正确")
+                            }
+                        }
+                    },
+                ],
+                // 
+                text: {
+                    noRecordsFound: '没有记录',
+                    showingPage: '显示页',
+                    show: '显示',
+                    entries: '明细',
+                    openAccountFormula: '设置科目取数公式',
+                    insertANewColumnBefore: '在前面插入一列',
+                    insertANewColumnAfter: '在后面插入一列',
+                    deleteSelectedColumns: '删除选中列',
+                    renameThisColumn: '重命名该列',
+                    orderAscending: '按升序排列',
+                    orderDescending: '按降序排列',
+                    insertANewRowBefore: '在前面插入一行',
+                    insertANewRowAfter: '在后面插入一行',
+                    deleteSelectedRows: '删除选中行',
+                    editComments: '编辑批批注',
+                    addComments: '添加批注',
+                    comments: '批注',
+                    clearComments: '清除批注',
+                    copy: '复制',
+                    paste: '粘贴',
+                    saveAs: '下载保存',
+                    // about: ​ '关于', 修改后将无法使用
+                    areYouSureToDeleteTheSelectedRows: '你确定要删除选中行?',
+                    areYouSureToDeleteTheSelectedColumns: '你确定要删除选中列?',
+                    thisActionWillDestroyAnyExistingMergedCellsAreYouSure: '你是否确定要取消合并单元格?',
+                    thisActionWillClearYourSearchResultsAreYouSure: '该操作会清除你的搜索结果，你是否确定?',
+                    thereIsAConflictWithAnotherMergedCell: '与另一个合并的单元格有冲突!',
+                    invalidMergeProperties: '无效的合并',
+                    cellAlreadyMerged: '单元格已经被合并,可以取消合并',
+                    noCellsSelected: '没有选中任何单元格',
+
+                },
+                onload: function (instance) {
+                    // 初始化表格单元格值
+                    instance.jexcel.setStyle($.parseJSON(self.record.data['data_style']));
+                    // 初始化表格行和列的高度和宽度
+                    var width_info = $.parseJSON(self.record.data['width_info']);
+                    var columns = Object.keys(width_info);
+                    var height_info = $.parseJSON(self.record.data['height_info']);
+                    var rows = Object.keys(height_info);
+                    var column;
+                    for (column in columns) {
+                        instance.jexcel.setWidth(column, width_info[column])
+                    };
+                    var row;
+                    for (row in rows) {
+                        if (height_info[row]) {
+                            instance.jexcel.setHeight(row, height_info[row])
+                        } else {
+                            // 默认行高
+                            instance.jexcel.setHeight(row, instance.jexcel.opetions.defaultRowsHeight);
+                        }
+                    };
+                    // 初始化表格表头名称
+                    if (self.record.data['header_info']) {
+                        var headers = (self.record.data['header_info']).split(',');
+                        var i;
+                        for (i = 0; i < headers.length; i++) {
+                            instance.jexcel.setHeader(i, headers[i]);
+                        };
+                    };
+                    // 初始化表格批次注
+                    var comments = JSON.parse(self.record.data['comments_info']);
+                    for (var cellName in comments) {
+                        instance.jexcel.setComments(cellName, comments[cellName]);
+                    };
+                    // 初始化公式
+                    var metas = JSON.parse(self.record.data['meta_info']);
+                    for (var cellName in metas) {
+                        for (var k in metas[cellName]) {
+                            instance.jexcel.setMeta(cellName, k, metas[cellName][k]);
+                        }
+                    }
+                    // instance.jexcel.setMeta(JSON.parse(self.record.data['meta_info']));
+                    // 选中第一个单元格，以在点击保存时触发onblur事件
+                    instance.jexcel.updateSelectionFromCoords(0, 0, 0, 0);
+                },
+                onchange: function (instance, cell, x, y, value) {
+                    self._setValue(JSON.stringify(instance.jexcel.getData()));
+                    var cellName = jexcel.getColumnNameFromId([x, y]);
+                    var data = instance.jexcel.getData()[y][x];
+                    if (self._isACFormula(data)) {
+                        try {
+                            var cellformula = new ACFormula(data);
+                            instance.jexcel.setMeta(cellName, cellformula.name(), cellformula.value());
+                        } catch (error) {
+                            self.do_warn(error);
+                        }
+                    } else {
+                        // var meta=instance.jexcel.getMeta(cellName);
+                        // for(var k in meta){
+                        //     instance.jexcel.setMeta(cellName,k,null);
+                        // }
+                        if (instance.jexcel.options.meta && instance.jexcel.options.meta[cellName]) {
+                            delete instance.jexcel.options.meta[cellName];
+                        }
+                    }
+                },
+                oninsertrow: function (instance) {
+
+                },
+                ondeleterow: function (instance) {
+
+                    self._changeStyleAndData(instance);
+                },
+                oninsertcolumn: function (instance) {
+
+                },
+                ondeletecolumn: function (instance) {
+
+                    self._changeStyleAndData(instance);
+                },
+                onmoverow: function (instance) {
+
+                },
+                onmovecolumn: function (instance, from, to) {
+
+                },
+                onmerge: function (instance) {
+
+                },
+                onresizerow: function (instance) {
+
+                },
+                onresizecolumn: function (instance) {
+
+                },
+                onsort: function (instance, cellNum, order) {
+                    if (self.mode != 'edit') {
+                        return;
+                    }
+
+
+                },
+                onresizerow: function (instance, cell, height) {
+                    if (self.mode != 'edit') {
+                        return;
+                    }
+
+                },
+                onresizecolumn: function (instance, cell, width) {
+                    if (self.mode != 'edit') {
+                        return;
+                    }
+
+                },
+                onchangeheader: function (instantce, column, old_name, new_name) {
+                    if (this.mode != 'edit') {
+                        return;
+                    }
+                },
+                onmerge: function () {
+
+                },
+
+                onblur: function (instance) {
+                    self._changeStyleAndData(instance);
+
+                },
+                onfocus() {
+
+                },
+                onselection: function (instance, x1, y1, x2, y2, origin) {
+                    self._setSelectionCells(x1, y1, x2, y2);
+                },
+                updateTable: function (instance, cell, col, row, val, label, cellName) {
+
+                },
+
+            };
+            self.jexcel_obj = jexcel(this.ddom, options);
+            // 设置右键科目取数公式菜单在编辑状态下可见
+            self.jexcel_obj.options.allowOpenAccountFormula = (this.mode === 'edit');
+            // 设置默认行高             
+            self.jexcel_obj.options.defaultRowsHeight = 25;
+            // 注册打开设置公式向导方法                                                                     
+            self.jexcel_obj.openAccountFormula = function () {
+                self._openAccountFormulaWizard();
+            };
+
+        },
+        _renderReadonly: function () {
+            this._renderEdit(arguments);
+        },
+        // 打开报表公式设置向导窗体
+        _openAccountFormulaWizard: function () {
+            var formula = self.jexcel_obj.getValueFromCoords(self.selection_x1, self.selection_y1) || '';
+            if (formula) {
+                var pre = formula.slice(0, 5);
+                var last = formula.slice(-2);
+                if (pre == '=ac("' && last == '")') {
+                    // if 单元格定义了ac公式
+                    var context = {
+                        ac: (formula.slice(0, -2)).slice(5)
+                    }
+                    this.do_action({
+                        name: '报表科目取数公式设置向导',
+                        type: 'ir.actions.act_window',
+                        res_model: 'accountcore.reportmodel_formula',
+                        context: context,
+                        views: [
+                            [false, 'form']
+                        ],
+                        target: 'new'
+                    });
+                    return;
+                }
+            }
+            this.do_action({
+                name: '报表科目取数公式设置向导',
+                type: 'ir.actions.act_window',
+                res_model: 'accountcore.reportmodel_formula',
+                views: [
+                    [false, 'form']
+                ],
+                target: 'new'
+            });
+
+
+        },
+    });
+    // 表格设计器表格的样式字段小部件
+    var ac_jexcel_style = AbstractField.extend({
+        events: _.extend({}, AbstractField.prototype.events, {}),
+        supportedFieldTypes: ['text'],
+        template: 'ac_jexcel',
+        start: function () {
+            this._super.apply(this, arguments);
+            core.bus.on('ac_jexcel_style_change', this, this._onStyleChange);
+        },
+        _onStyleChange: function (style) {
+            this._setValue(JSON.stringify(style));
+        },
+    });
+    // 保存表格列宽度信息小部件
+    var ac_jexcel_width_info = AbstractField.extend({
+        events: _.extend({}, AbstractField.prototype.events, {}),
+        supportedFieldTypes: ['text'],
+        template: 'ac_jexcel',
+        start: function () {
+            this._super.apply(this, arguments);
+            core.bus.on('ac_jexcel_width_change', this, this._onWidthChange);
+        },
+        _onWidthChange: function (value) {
+            // this.info[value[0]] = value[1];
+            this._setValue(JSON.stringify(value));
+        },
+    });
+    // 保存表格行高度信息小部件
+    var ac_jexcel_height_info = AbstractField.extend({
+        events: _.extend({}, AbstractField.prototype.events, {}),
+        supportedFieldTypes: ['text'],
+        template: 'ac_jexcel',
+        start: function () {
+            this._super.apply(this, arguments);
+            core.bus.on('ac_jexcel_height_change', this, this._onHeightChange);
+        },
+        _onHeightChange: function (value) {
+            // this.info[value[0]] = value[1];
+            this._setValue(JSON.stringify(value));
+        },
+    });
+    // 保存表格头名称信息小部件
+    var ac_jexcel_header_info = AbstractField.extend({
+        events: _.extend({}, AbstractField.prototype.events, {}),
+        supportedFieldTypes: ['text'],
+        template: 'ac_jexcel',
+        start: function () {
+            this._super.apply(this, arguments);
+            core.bus.on('ac_jexcel_header_change', this, this._onHeaderChange);
+        },
+        _onHeaderChange: function (value) {
+            this._setValue(value);
+        },
+    });
+    // 保存表格批注信息小部件
+    var ac_jexcel_comments_info = AbstractField.extend({
+        events: _.extend({}, AbstractField.prototype.events, {}),
+        supportedFieldTypes: ['text'],
+        template: 'ac_jexcel',
+        start: function () {
+            this._super.apply(this, arguments);
+            core.bus.on('ac_jexcel_comments_change', this, this._onCommentsChange);
+        },
+        _onCommentsChange: function (value) {
+            this._setValue(JSON.stringify(value));
+        },
+    });
+    // 保存表格的合并单元格信息小部件
+    var ac_jexcel_merge_info = AbstractField.extend({
+        events: _.extend({}, AbstractField.prototype.events, {}),
+        supportedFieldTypes: ['text'],
+        template: 'ac_jexcel',
+        start: function () {
+            this._super.apply(this, arguments);
+            core.bus.on('ac_jexcel_merge_change', this, this._onMergeChange);
+        },
+        _onMergeChange: function (value) {
+            this._setValue(JSON.stringify(value));
+        },
+    });
+    // 保存表格的公式信息小部件
+    var ac_jexcel_meta_info = AbstractField.extend({
+        events: _.extend({}, AbstractField.prototype.events, {}),
+        supportedFieldTypes: ['text'],
+        template: 'ac_jexcel',
+        start: function () {
+            this._super.apply(this, arguments);
+            core.bus.on('ac_jexcel_meta_change', this, this._onMetaChange);
+        },
+        _onMetaChange: function (value) {
+            this._setValue(JSON.stringify(value));
+        },
+    });
+    // 客户端动作，从后台获得通过向导设置的公式
+    var update_formula = AbstractAction.extend({
+        context: {},
+        init: function (classInfo, obj1, obj2) {
+            this.context = obj1.context;
+            this._super.apply(this, arguments);
+        },
+        start: function () {
+            core.bus.trigger('ac_jexcel_set_formula', this.context.accountName);
+        },
+        on_attach_callback: function () {
+            // 取消遮挡的小部件
+            $('.modal-dialog button').trigger('click');
+        },
+    });
+    core.action_registry.add('update_formula', update_formula);
+    var fieldRegistry = require('web.field_registry');
+    fieldRegistry.add('ac_jexcel', ac_jexcel);
+    fieldRegistry.add('ac_jexcel_style', ac_jexcel_style);
+    fieldRegistry.add('ac_jexcel_width_info', ac_jexcel_width_info);
+    fieldRegistry.add('ac_jexcel_height_info', ac_jexcel_height_info);
+    fieldRegistry.add('ac_jexcel_header_info', ac_jexcel_header_info);
+    fieldRegistry.add('ac_jexcel_comments_info', ac_jexcel_comments_info);
+    fieldRegistry.add('ac_jexcel_merge_info', ac_jexcel_merge_info);
+    fieldRegistry.add('ac_jexcel_meta_info', ac_jexcel_meta_info);
+    return {
+        ac_jexcel: ac_jexcel,
+        ac_jexcel_style: ac_jexcel_style,
+        ac_jexcel_width_info: ac_jexcel_width_info,
+        ac_jexcel_height_info: ac_jexcel_height_info,
+        ac_jexcel_header_info: ac_jexcel_header_info,
+        ac_jexcel_comments_info: ac_jexcel_comments_info,
+        ac_jexcel_merge_info: ac_jexcel_merge_info,
+        ac_jexcel_meta_info: ac_jexcel_meta_info,
     };
 });

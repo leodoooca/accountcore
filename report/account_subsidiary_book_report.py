@@ -18,6 +18,7 @@ sys.path.append('.\\.\\server')
 class SubsidiaryBook(models.AbstractModel):
     '''查询明细账'''
     _name = 'report.accountcore.subsidiary_book_report'
+    _description = '明细账查询报表'
     @api.model
     def _get_report_values(self, docids, data=None):
         form = data['form']
@@ -35,7 +36,9 @@ class SubsidiaryBook(models.AbstractModel):
         tasticsTypes = self.env['accountcore.voucher_number_tastics'].sudo(
         ).search([('id', '!=', 0)])
         # 获得查询科目及其全部明细科目的ID列表,通过科目编号查找
-        accountMeChild = main_account.getMeAndChild_ids()
+        searchAccount = [account_id]
+        if not form['only_this_level']:
+            searchAccount = main_account.getMeAndChild_ids()
         # 依据是否在查询向导中选择了核算项目,构建不同的查询参数,从数据库取出明细
         # if选择了核算项目
         if item:
@@ -46,13 +49,13 @@ class SubsidiaryBook(models.AbstractModel):
                       period.end_year,
                       period.end_month,
                       tuple(org_ids),
-                      tuple(accountMeChild),
+                      tuple(searchAccount),
                       item_id)
             # 从数据库获得需要的分录明细
             # 用于查询期初余额
             params2 = (period.start_year,
                        tuple(org_ids),
-                       tuple(accountMeChild),
+                       tuple(searchAccount),
                        item_id)
         # 没有选择核算项目
         else:
@@ -61,10 +64,10 @@ class SubsidiaryBook(models.AbstractModel):
                       period.end_year,
                       period.end_month,
                       tuple(org_ids),
-                      tuple(accountMeChild))
+                      tuple(searchAccount))
             params2 = (period.start_year,
                        tuple(org_ids),
-                       tuple(accountMeChild))
+                       tuple(searchAccount))
         # 从获得查询期间的分录明细
         entrys = self._getEntrys(params)
         # 科目在查询期间的全部分录明细,从开始日期的年初开始
@@ -340,7 +343,8 @@ class EntryArch(object):
                  'balance',
                  'direction',
                  'cash_flow',
-                 'is_not_begining']
+                 'is_not_begining',
+                 'is_PrebeginBalance']
 
     def __init__(self):
         self.voucher_id = 0,
@@ -365,6 +369,7 @@ class EntryArch(object):
         self.direction = None
         self.cash_flow = ''
         self.is_not_begining = True
+        self.is_PrebeginBalance = False
 
 
 # 年初余额
@@ -406,6 +411,7 @@ class PrebeginBalance(EntryArch):
 
     def __init__(self, year, month, direction, damount, camount):
         super(PrebeginBalance, self).__init__()
+        # 不要改变名称，在
         self.explain = '年初至启用期'
         self.year = year
         self.month = month
@@ -414,6 +420,7 @@ class PrebeginBalance(EntryArch):
         self.damount = damount
         self.camount = camount
         self.is_not_begining = False
+        self.is_PrebeginBalance = True
 
 
 # 本月合计
@@ -570,9 +577,9 @@ class EntrysAssembler():
                     e.balance = -tmp_pre_blanace-e.damount+e.camount
                 tmp_pre_blanace = tmp_pre_blanace+e.damount-e.camount
                 self.entrys.append(e)
-
-                sum_month_d = sum_month_d+e.damount
-                sum_month_c = sum_month_c+e.camount
+                if not e.is_PrebeginBalance:
+                    sum_month_d = sum_month_d+e.damount
+                    sum_month_c = sum_month_c+e.camount
                 sum_year_d = sum_year_d+e.damount
                 sum_year_c = sum_year_c+e.camount
 
@@ -601,8 +608,9 @@ class EntrysAssembler():
                 tmp_pre_blanace = tmp_pre_blanace+e.damount-e.camount
                 self.entrys.append(e)
 
-                sum_month_d = sum_month_d+e.damount
-                sum_month_c = sum_month_c+e.camount
+                if not e.is_PrebeginBalance:
+                    sum_month_d = sum_month_d+e.damount
+                    sum_month_c = sum_month_c+e.camount
                 sum_year_d = sum_year_d+e.damount
                 sum_year_c = sum_year_c+e.camount
 

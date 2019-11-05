@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from decimal import Decimal
 import json
 from odoo import api
 from odoo import exceptions
@@ -44,6 +45,7 @@ class CreateChildAccountWizard(models.TransientModel, Glob_tag_Model):
                                   ('-1', '贷')],
                                  string='余额方向',
                                  required=True)
+    is_show = fields.Boolean(string='凭证中显示', default=True)
     cashFlowControl = fields.Boolean(string='分配现金流量')
     itemClasses = fields.Many2many('accountcore.itemclass',
                                    string='包含的核算项目类别',
@@ -72,6 +74,11 @@ class CreateChildAccountWizard(models.TransientModel, Glob_tag_Model):
 
     @api.model
     def create(self, values):
+        if 'name' in values:
+            if '-' in values['name']:
+                raise exceptions.ValidationError("科目名称中不能含有'-'字符")
+            if ' ' in values['name']:
+                raise exceptions.ValidationError("科目名称中不能含有空格")
         fatherAccountId = self.env.context.get('active_id')
         accountTable = self.env['accountcore.account'].sudo()
         fatherAccount = accountTable.search(
@@ -81,6 +88,7 @@ class CreateChildAccountWizard(models.TransientModel, Glob_tag_Model):
                       'accountClass': fatherAccount.accountClass.id,
                       'cashFlowControl': values['cashFlowControl'],
                       'name': fatherAccount.name+'---'+values['name'],
+                      'direction': fatherAccount.direction,
                       'number': fatherAccount.number + '.'
                       + str(fatherAccount.currentChildNumber)}
         fatherAccount.currentChildNumber = fatherAccount.currentChildNumber+1
@@ -88,7 +96,7 @@ class CreateChildAccountWizard(models.TransientModel, Glob_tag_Model):
         rl = super(CreateChildAccountWizard, self).create(values)
         a = accountTable.create(values)
         # 添加到上级科目的直接下级
-        fatherAccount.write({'childs_ids': [(4, a.id)]})
+        fatherAccount.write({'childs_ids': [(4, a.id)], 'is_show': False})
         return rl
 
 
@@ -311,6 +319,7 @@ class GetAccountsBalance(models.TransientModel):
 class GetSubsidiaryBook(models.TransientModel):
     "科目明细账查询向导"
     _name = 'accountcore.get_subsidiary_book'
+    _description = '科目明细账查询向导'
     startDate = fields.Date(string='开始月份')
     endDate = fields.Date(string='结束月份')
     fast_period = fields.Date(string="选取期间", store=False)
@@ -320,6 +329,7 @@ class GetSubsidiaryBook(models.TransientModel):
                             required=True)
     account = fields.Many2one(
         'accountcore.account', string='查询的科目', required=True)
+    only_this_level = fields.Boolean(string='只包含本级科目', default=False)
     item = fields.Many2one('accountcore.item', string='查询的核算项目')
     voucher_number_tastics = fields.Many2one('accountcore.voucher_number_tastics',
                                              string='凭证号策略',
@@ -358,6 +368,7 @@ class GetSubsidiaryBook(models.TransientModel):
 class currencyDown_sunyi(models.TransientModel):
     "自动结转损益向导"
     _name = 'accountcore.currency_down_sunyi'
+    _description = '自动结转损益向导'
     startDate = fields.Date(string='开始月份', required=True)
     endDate = fields.Date(string='结束月份', required=True)
     fast_period = fields.Date(string="选取期间", store=False)
@@ -367,7 +378,7 @@ class currencyDown_sunyi(models.TransientModel):
         default=lambda s: s.env.user.currentOrg, required=True)
 
     # def soucre(self):
-    #     return self.env.ref('rulebook_999')
+    #     return self.env.ref('rulebook_1')
 
     @api.multi
     def do(self, *args):
@@ -386,9 +397,19 @@ class currencyDown_sunyi(models.TransientModel):
         # 本年利润科目
         self.ben_nian_li_run_account = self.env['accountcore.special_accounts'].sudo().search([
             ('name', '=', '本年利润科目')]).accounts
+        if self.ben_nian_li_run_account:
+            self.ben_nian_li_run_account_id = self.ben_nian_li_run_account.id
+        else:
+            self.ben_nian_li_run_account_id = self.env.ref(
+                'special_accounts_1')
         # 损益调整科目
         self.sun_yi_tiao_zhen_account = self.env['accountcore.special_accounts'].sudo().search([
             ('name', '=', '以前年度损益调整科目')]).accounts
+        if self.sun_yi_tiao_zhen_account:
+            self.sun_yi_tiao_zhen_account_id = self.sun_yi_tiao_zhen_account.id
+        else:
+            self.sun_yi_tiao_zhen_account_id = self.env.ref(
+                'special_accounts_3')
         # 依次处理选种机构
         # 生成的凭证列表
         voucher_ids = []
@@ -424,7 +445,8 @@ class currencyDown_sunyi(models.TransientModel):
         # 属于损益类别的科目,但不包括"以前年度损益调整"
         accounts = self.env['accountcore.account'].sudo().search([('accountClass.name', '=', '损益类'),
                                                                   ('id', '!=',
-                                                                   self.sun_yi_tiao_zhen_account.id),
+                                                                   #    self.sun_yi_tiao_zhen_account.id),
+                                                                   self.sun_yi_tiao_zhen_account_id),
                                                                   '|', ('org',
                                                                         '=', org.id),
                                                                   ('org', '=', False)])
@@ -454,9 +476,10 @@ class currencyDown_sunyi(models.TransientModel):
     def _creat_voucher(self, accountsBalance, org, voucer_period):
         '''新增结转损益凭证'''
         # 结转到本年利润的借方合计
-        sum_d = 0
+        zero = Decimal.from_float(0).quantize(Decimal('0.00'))
+        sum_d = Decimal.from_float(0).quantize(Decimal('0.00'))
         # 结转到本年利润的贷方合计
-        sum_c = 0
+        sum_c = Decimal.from_float(0).quantize(Decimal('0.00'))
 
         entrys_value = []
         # 根据科目余额生成分录
@@ -464,36 +487,39 @@ class currencyDown_sunyi(models.TransientModel):
             b_items_id = []
             if b.items.id:
                 b_items_id = [b.items.id]
-            endAmount = b.endDamount-b.endCamount
+            endAmount = Decimal.from_float(b.endDamount).quantize(
+                Decimal('0.00'))-Decimal.from_float(b.endCamount).quantize(Decimal('0.00'))
             if b.account.direction == '1':
-                if endAmount != 0:
+                if endAmount != zero:
 
                     entrys_value.append({"explain": '结转损益',
                                          "account": b.account.id,
                                          "items": [(6, 0, b_items_id)],
                                          "camount": endAmount
                                          })
-                    sum_d = sum_d+endAmount
+                    sum_d = sum_d + endAmount
             else:
-                if endAmount != 0:
+                if endAmount != zero:
                     entrys_value.append({"explain": '结转损益',
                                          "account": b.account.id,
                                          "items": [(6, 0, b_items_id)],
                                          "damount": -endAmount
                                          })
-                    sum_c = sum_c-endAmount
+                    sum_c = sum_c - endAmount
         # 本年利润科目分录
 
         # 结转到贷方
-        if sum_d != 0:
+        if sum_d != zero:
             entrys_value.append({"explain": '结转损益',
-                                 "account": self.ben_nian_li_run_account.id,
+                                 #  "account": self.ben_nian_li_run_account.id,
+                                 "account": self.ben_nian_li_run_account_id,
                                  "damount": sum_d
                                  })
         # 结转到借方
-        if sum_c != 0:
+        if sum_c != zero:
             entrys_value.append({"explain": '结转损益',
-                                 "account": self.ben_nian_li_run_account.id,
+                                 #  "account": self.ben_nian_li_run_account.id,
+                                 "account": self.ben_nian_li_run_account_id,
                                  "camount": sum_c
                                  })
         if len(entrys_value) < 2:
@@ -503,7 +529,7 @@ class currencyDown_sunyi(models.TransientModel):
             'voucherdate': voucer_period.endDate,
             'org': org.id,
             'soucre': self.env.ref('accountcore.source_2').id,
-            'ruleBook': [(6, 0, [self.env.ref('accountcore.rulebook_999').id])],
+            'ruleBook': [(6, 0, [self.env.ref('accountcore.rulebook_1').id])],
             'entrys': [(6, 0, entrys.ids)],
             'createUser': self.env.uid,
         })
@@ -514,6 +540,7 @@ class currencyDown_sunyi(models.TransientModel):
 class BeginBalanceCheck(models.TransientModel):
     '''启用期初试算平衡向导'''
     _name = 'accountcore.begin_balance_check'
+    _description = '启用期初试算平衡向导'
     org_ids = fields.Many2many('accountcore.org',
                                string='待检查机构',
                                required=True,
@@ -667,3 +694,198 @@ class CreateChildCashoFlowWizard(models.TransientModel, Glob_tag_Model):
         return rl
 
         # 向导部分-结束
+
+
+# 报表生成向导
+class GetReport(models.TransientModel):
+    "报表生成向导"
+    _name = 'accountcore.get_report'
+    _description = '报表生成向导'
+    report_model = fields.Many2one('accountcore.report_model',
+                                   string='报表模板')
+    guid = fields.Char(related='report_model.guid')
+    summary = fields.Text(related='report_model.summary')
+    startDate = fields.Date(string='开始月份',
+                            required=True,
+                            default=lambda s: s.env.user.current_date)
+    endDate = fields.Date(string='结束月份',
+                          required=True,
+                          default=lambda s: s.env.user.current_date)
+    fast_period = fields.Date(string="选取期间", store=False)
+    orgs = fields.Many2many('accountcore.org',
+                            string='机构范围',
+                            default=lambda s: s.env.user.currentOrg,
+                            required=True)
+
+    def do(self):
+        '''根据模板生成报表'''
+        report = self.env['accountcore.report_model'].sudo().browse(
+            self.report_model.id)
+        report[0].startDate = self.startDate
+        report[0].endDate = self.endDate
+        report[0].orgs = self.orgs
+        return {
+            'name': "生成报表",
+            'type': 'ir.actions.act_window',
+            'res_model': 'accountcore.report_model',
+            'view_type': 'form',
+            'view_mode': 'form',
+            'target': 'current',
+            'res_id': self.report_model.id,
+            'context': {
+                'form_view_initial_mode': 'edit',
+            }
+        }
+
+# 设置报表模板公式向导
+
+
+class ReportModelFormula(models.TransientModel):
+    '''设置报表公式向导'''
+    _name = 'accountcore.reportmodel_formula'
+    _description = '设置报表公式向导'
+    account_id = fields.Many2one('accountcore.account', string='会计科目')
+    has_child = fields.Boolean(string='是否包含明细科目', default=True)
+    item_ids = fields.Many2many('accountcore.item', string='作为明细科目的核算项目')
+    account_amount_type = fields.Many2one('accountcore.account_amount_type',
+                                          string='金额类型')
+    formula = fields.Text(string='公式内容')
+    btn_join_reduce = fields.Char()
+    btn_join_add = fields.Char()
+    btn_clear = fields.Char()
+    @api.model
+    def default_get(self, field_names):
+        default = super().default_get(field_names)
+        if self.env.context.get('ac'):
+            default['formula'] = self.env.context.get('ac')
+        return default
+
+    def do(self):
+        '''公式填入单元格'''
+        return {
+            'type': 'ir.actions.client',
+            'name': '',
+            'tag': 'update_formula',
+            'target': 'new',
+            'context': {'accountName': self.formula}
+        }
+
+    @api.onchange('btn_join_reduce')
+    def join_reduce(self):
+        '''减进公式'''
+        # 窗口弹出时不执行，直接返回
+        if not self.btn_join_reduce:
+            return
+        if not self.account_id.name:
+            return {
+                'warning': {
+                    'message': "请选择会计科目",
+                },
+            }
+        if not self.account_amount_type:
+            return {
+                'warning': {
+                    'message': "请选择金额类型",
+                },
+            }
+        items = ''
+        for i in self.item_ids:
+            items = items+i.name+'/'
+        mark = "-"
+        if not self.formula:
+            self.formula = ""
+        self.formula = (self.formula+mark+"account('"
+                        + self.account_id.name
+                        + "','"+str(self.has_child)
+                        + "','"+self.account_amount_type.name
+                        + "','"+items
+                        + "')")
+
+    @api.onchange('btn_join_add')
+    def join_add(self):
+        '''加进公式'''
+        # 窗口弹出时不执行，直接返回
+        if not self.btn_join_add:
+            return
+        if not self.account_id.name:
+            return {
+                'warning': {
+                    'message': "请选择会计科目",
+                },
+            }
+        if not self.account_amount_type:
+            return {
+                'warning': {
+                    'message': "请选择金额类型",
+                },
+            }
+        items = ''
+        for i in self.item_ids:
+            items = items+i.name+'/'
+        mark = ""
+        if self.formula:
+            mark = "+"
+        else:
+            self.formula = ""
+        self.formula = (self.formula+mark+"account('"
+                        + self.account_id.name
+                        + "','"+str(self.has_child)
+                        + "','"+self.account_amount_type.name
+                        + "','"+items
+                        + "')")
+
+    @api.onchange('btn_clear')
+    def join_clear(self):
+        '''清除公式'''
+        # 窗口弹出时不执行，直接返回
+        if not self.btn_clear:
+            return
+        self.formula = ""
+
+
+class StoreReport(models.TransientModel):
+    '''报表归档向导'''
+    _name = 'accountcore.store_report'
+    _description = '报表归档向导'
+    number = fields.Char(string='归档报表编号')
+    name = fields.Char(string='归档报表名称', required=True)
+    create_user = fields.Many2one('res.users',
+                                  string='归档人',
+                                  default=lambda s: s.env.uid,
+                                  readonly=True,
+                                  required=True,
+                                  ondelete='restrict',
+                                  index=True)
+    start_date = fields.Date(string='数据开始月份')
+    end_date = fields.Date(string='数据结束月份')
+    orgs = fields.Many2many('accountcore.org', string='机构范围', required=True)
+    receivers = fields.Many2many('accountcore.receiver', string='接收者(报送对象)')
+    summary = fields.Text(string='归档报表说明')
+    htmlstr = fields.Html(string='html内容')
+
+    def do(self):
+        reportModelId = self._context["model_id"]
+        reportModel = self.env['accountcore.report_model'].sudo().browse([
+            reportModelId])[0]
+        orgIds = [org.id for org in reportModel.orgs]
+        receiversIds = [r.id for r in self.receivers]
+        self.env['accountcore.storage_report'].sudo().create([{
+            "report_type": reportModel.report_type.id,
+            "receivers":  [(6, 0, receiversIds)],
+            "endDate": reportModel.endDate,
+            "startDate": reportModel.startDate,
+            "summary": self.summary,
+            "data": reportModel.data,
+            "data_style":reportModel.data_style,
+            "width_info":reportModel.width_info,
+            "height_info":reportModel.height_info,
+            "header_info":reportModel.header_info,
+            "comments_info":reportModel.comments_info,
+            "merge_info":reportModel.merge_info,
+            "meta_info":reportModel.meta_info,
+            "number": self.number,
+            "name": self.name,
+            "create_user": self.env.uid,
+            "orgs":  [(6, 0, orgIds)],
+        }
+        ])

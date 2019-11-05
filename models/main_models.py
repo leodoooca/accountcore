@@ -5,6 +5,7 @@ from decimal import Decimal
 import json
 import logging
 import multiprocessing
+from ..models.ac_obj import ACTools
 from odoo import models, fields, api, SUPERUSER_ID, exceptions
 import sys
 sys.path.append('.\\.\\server\\odoo')
@@ -19,6 +20,7 @@ VOCHER_LOCK = multiprocessing.Lock()
 class Glob_tag_Model(models.AbstractModel):
     '''全局标签模型,用于多重继承方式添加到模型'''
     _name = "accountcore.glob_tag_model"
+    _description = '全局标签模型'
     glob_tag = fields.Many2many('accountcore.glob_tag',
                                 string='全局标签',
                                 index=True)
@@ -236,7 +238,8 @@ class Item(models.Model, Glob_tag_Model):
 
 
 # 凭证标签
-class RuleBook(models.Model):
+class RuleBook(models.Model, Glob_tag_Model):
+    '''特殊的会计科目'''
     '''凭证标签'''
     _name = 'accountcore.rulebook'
     _description = '凭证标签'
@@ -246,6 +249,24 @@ class RuleBook(models.Model):
                          '标签编码重复了!'),
                         ('accountcore_rulebook_name_unique', 'unique(name)',
                          '标签名称重复了!')]
+    # 获得所有标记的凭证
+
+    def getVouchers(self):
+        '''获得所有标记的凭证'''
+        vouchers = self.env['accountcore.voucher'].sudo().search(
+            [('ruleBook', '=', self.id)])
+        return vouchers
+
+    # 获得机构下所有标记的凭证
+    def getVouchersOfOrg(self, org, periods=None):
+        '''获得机构下所有标记的凭证'''
+        vouchers = self.getVouchers().filtered(lambda v: v.org.id == org.id)
+        if (periods):
+            records = vouchers.filtered(
+                lambda v: periods.includeDateTime(v.voucherdate))
+            return records
+        else:
+            return vouchers
 
 
 # 科目类别
@@ -288,6 +309,8 @@ class Account(models.Model, Glob_tag_Model):
                                   ('-1', '贷')],
                                  string='余额方向',
                                  required=True)
+    is_show = fields.Boolean(string='凭证中可选', default=True)
+    is_last = fields.Boolean(string='末级科目', compute="_is_last", store=True)
     cashFlowControl = fields.Boolean(string='分配现金流量')
     itemClasses = fields.Many2many('accountcore.itemclass',
                                    string='科目要统计的核算项目类别',
@@ -306,7 +329,6 @@ class Account(models.Model, Glob_tag_Model):
                                  'fatherAccountId',
                                  string='直接下级科目',
                                  ondelete='restrict')
-    # is_end = fields.Boolean(string='是否最明细级科目')
     currentChildNumber = fields.Integer(default=10,
                                         string='新建下级科目待用编号')
     explain = fields.Html(string='科目说明')
@@ -318,6 +340,26 @@ class Account(models.Model, Glob_tag_Model):
                          '科目编码重复了!'),
                         ('accountcore_account_name_unique', 'unique(name)',
                          '科目名称重复了!')]
+
+    @api.model
+    def create(self, values):
+        '''新增科目'''
+        self._check_name(values['name'])
+        rl = super(Account, self).create(values)
+        return rl
+
+    @api.multi
+    def write(self, values):
+        '''修改科目'''
+        if 'name' in values:
+            self._check_name(values['name'])
+        rl = super(Account, self).write(values)
+        return rl
+
+    def _check_name(self, name):
+        '''检查科目名称'''
+        if ' ' in name:
+            raise exceptions.ValidationError("科目名称中不能含有空格")
 
     @api.onchange('accountItemClass')
     def _checkAccountItem(self):
@@ -344,6 +386,16 @@ class Account(models.Model, Glob_tag_Model):
         if self.accountItemClass and self.accountItemClass.id not in item_ids:
             raise exceptions.ValidationError(
                 '['+self.accountItemClass.name+"]已经作为明细科目的类别,不能删除.如果要删除,请你在'作为明细的类别'中先取消它")
+
+    @api.multi
+    @api.depends('childs_ids')
+    def _is_last(self):
+        '''是否末级科目'''
+        for a in self:
+            if a.childs_ids:
+                a.is_last = False
+            else:
+                a.is_last = True
 
     @api.model
     def name_search(self, name='', args=None, operator='ilike', limit=0):
@@ -432,16 +484,34 @@ class Account(models.Model, Glob_tag_Model):
                                               accountItemClassId) else itemType.name)+"</span>"
             account.itemClassesHtml = content
         return True
-
+    # 获得科目下的全部明细科目和自生对象的ID
     @api.multi
     def getMeAndChild_ids(self):
-        '''获得科目下的全部明细科目和自生'''
+        '''获得科目下的全部明细科目和自生的ID'''
         self.ensure_one()
         # 通过科目编码来判断
         return self.search([('number', 'like', self.number)]).mapped('id')
+    # 获得科目下的全部明细科目和自生对象
+    @api.multi
+    def getMeAndChilds(self):
+        '''获得科目下的全部明细科目和自生'''
+        self.ensure_one()
+        # 通过科目编码来判断
+        return self.search([('number', 'like', self.number)])
+
+      # 获得科目的余额记录，未排序，相同科目下的不同机构和核算项目视为同一科目
+
+    def getAllBalances(self):
+        '''获得科目的余额记录,相同科目下的不同机构和核算项目视为同一科目'''
+        domain = [('account', '=', self.id)]
+        account_balances = self.env["accountcore.accounts_balance"].sudo().search(
+            domain)
+        return account_balances
+
+    # 获得科目的余额记录，未排序
 
     def getBalances(self, org=None, item=None):
-        '''获得科目的余额记录'''
+        '''获得科目(考虑机构和核算项目)的余额记录,相同科目下的不同机构和核算项目视为不同科目'''
         domain = [('account', '=', self.id)]
         if item:
             domain.append(('items', '=', item.id))
@@ -454,22 +524,25 @@ class Account(models.Model, Glob_tag_Model):
         account_balances = self.env["accountcore.accounts_balance"].sudo().search(
             domain)
         return account_balances
+    # 获得启用期初的记录
 
     def getBegins(self, org=None, item=None):
         '''获得启用期初的记录'''
         rs = self.getBalances(org, item)
-        rs.filtered(lambda r: r.isbegining)
-        if len(rs) == 0:
+        rl = rs.filtered(lambda r: r.isbegining)
+        if len(rl) == 0:
             return None
-        return rs
+        return rl
+    # 获得指定月份的余额记录
 
     def getBlanceOf(self, year, month, org=None, item=None):
         '''获得指定月份的余额记录'''
         rs = self.getBalances(org, item)
-        rs.filtered(lambda r: r.year == year and r.month == month)
-        if len(rs) == 0:
+        rl = rs.filtered(lambda r: r.year == year and r.month == month)
+        if len(rl) == 0:
             return None
-        return rs
+        return rl
+    # 获得科目余额链(按期间排序，包含期初)
 
     def getChain(self, org, item=None):
         '''获得科目余额链,期间从早到晚'''
@@ -478,12 +551,182 @@ class Account(models.Model, Glob_tag_Model):
             r.year, r.month, not r.isbegining))
         return rs_sorted
 
+        # 获得当下科目余额记录
+    def getBalanceOfVoucherPeriod(self, voucher_period, org, item):
+        '''获得指定会计期间的科目余额记录'''
+        chain = self.getChain(org, item)
+        compareMark = voucher_period.year*12+voucher_period.month
+        rs = chain.filtered(lambda r: (r.year*12+r.month) <= compareMark)
+        if len(rs) == 0:
+            balance = None
+        else:
+            balance = rs[-1]
+        return balance
+
     def getBalance(self, org, item):
         '''获得当下科目余额记录'''
         chain = self.getChain(org, item)
         if len(chain) == 0:
             return None
         return chain[-1]
+
+    def getBalanceBetween(self, start_p, end_p, org, item):
+        '''获得一个期间范围的余额记录'''
+        chain = self.getChain(org, item)
+        startMark = start_p.year*12+start_p.month
+        endMark = end_p.year*12+end_p.month
+        rs = chain.filtered(lambda r: startMark <=
+                            (r.year*12+r.month) <= endMark)
+        if len(rs) == 0:
+            balance = None
+        else:
+            balance = rs
+        return balance
+    # 获取指定会计期间的期初余额
+
+    def getBegingAmountOf(self, voucher_period, org, item):
+        '''获得会计期间的期初余额'''
+        amount = 0
+        startP = voucher_period
+        preP = startP.getPreP()
+        # 获取前一个期间的期末余额
+        balance = self.getBalanceOfVoucherPeriod(preP, org, item)
+        if balance:
+            if self.direction == '1':
+                amount = balance.endDamount-balance.endCamount
+            else:
+                amount = balance.endCamount-balance.endDamount
+        else:
+            # 期初
+            balance = self.getBalanceOfVoucherPeriod(startP, org, item)
+            if balance:
+                if self.direction == '1':
+                    amount = balance.beginingDamount-balance.beginingCamount
+                else:
+                    amount = balance.beginingCamount-balance.beginingCamount
+        return amount
+
+    # 获得指定会计期间的期初借方余额
+    def getBegingDAmountOf(self, voucher_period, org, item):
+        '''获得会计期间的期初借方余额'''
+        amount = 0
+        startP = voucher_period
+        preP = startP.getPreP()
+        # 获取前一个期间的期末余额
+        balance = self.getBalanceOfVoucherPeriod(preP, org, item)
+        if balance:
+            amount = balance.endDamount-balance.endCamount
+            if amount < 0:
+                amount = 0
+        else:
+            # 期初
+            balance = self.getBalanceOfVoucherPeriod(startP, org, item)
+            if balance:
+                amount = balance.beginingDamount-balance.beginingCamount
+                if amount < 0:
+                    amount = 0
+        return amount
+    # 获得指定会计期间的期初贷方余额
+
+    def getBegingCAmountOf(self, voucher_period, org, item):
+        '''获得会计期间的期初贷方方余额'''
+        amount = 0
+        startP = voucher_period
+        preP = startP.getPreP()
+        # 获取前一个期间的期末余额
+        balance = self.getBalanceOfVoucherPeriod(preP, org, item)
+        if balance:
+            amount = balance.endCamount-balance.endDamount
+            if amount < 0:
+                amount = 0
+        else:
+            # 期初
+            balance = self.getBalanceOfVoucherPeriod(startP, org, item)
+            if balance:
+                amount = balance.beginingCamount-balance.beginingDamount
+                if amount < 0:
+                    amount = 0
+        return amount
+    # 获得一个期间的借方发生额
+
+    def getDamountBetween(self, start_p, end_p, org, item):
+        '''获得一个期间的借方发生额'''
+        chains = self.getBalanceBetween(start_p, end_p, org, item)
+        amount = 0
+        if chains:
+            for i in range(0, len(chains)):
+                amount += chains[i].damount
+        return amount
+
+    # 获得一个期间的贷方发生额
+    def getCamountBetween(self, start_p, end_p, org, item):
+        '''获得一个期间的贷方发生额'''
+        chains = self.getBalanceBetween(start_p, end_p, org, item)
+        amount = 0
+        if chains:
+            for i in range(0, len(chains)):
+                amount += chains[i].camount
+        return amount
+    # 获得指定会计期间的期末余额
+
+    def getEndAmountOf(self, end_p, org, item):
+        '''获得指定会计期间的期末余额'''
+
+        amount = 0
+        endP = end_p
+        balance = self.getBalanceOfVoucherPeriod(endP, org, item)
+        if balance:
+            if self.direction == '1':
+                amount = balance.endDamount-balance.endCamount
+            else:
+                amount = balance.endCamount-balance.endDamount
+        return amount
+    # 期末借方余额
+
+    def getEndDAmount(self, end_p, org, item):
+        '''期末借方余额'''
+        amount = 0
+        endP = end_p
+        balance = self.getBalanceOfVoucherPeriod(endP, org, item)
+        if balance:
+            amount = balance.endDamount-balance.endCamount
+            if amount < 0:
+                amount = 0
+        return amount
+
+    # 期末贷方余额
+    def getEndCAmount(self, end_p, org, item):
+        '''期末借方余额'''
+        amount = 0
+        endP = end_p
+        balance = self.getBalanceOfVoucherPeriod(endP, org, item)
+        if balance:
+            amount = balance.endCamount-balance.endDamount
+            if amount < 0:
+                amount = 0
+        return amount
+
+    # 获得指定会计期间的本年累计金额（借方，贷方）
+
+    def getCumulativeAmountOf(self, voucher_period, org, item):
+        '''获得指定期间的本年累计金额'''
+        balance = self.getBalanceOfVoucherPeriod(voucher_period, org, item)
+        if balance:
+            return (balance.cumulativeDamount, balance.cumulativeCamount)
+        else:
+            return (0, 0)
+    # 获得指定会计期间的本年借方累计
+
+    def getCumulativeDAmountOf(self, voucher_period, org, item):
+        '''获得指定会计期间的本年借方累计'''
+        return self.getCumulativeAmountOf(voucher_period, org, item)[0]
+    # 获得指定会计期间的本年贷方累计
+
+    def getCumulativeCAmountOf(self, voucher_period, org, item):
+        '''获得指定会计期间的本年贷方累计'''
+        return self.getCumulativeAmountOf(voucher_period, org, item)[1]
+
+    # 获得当下科目的余额
 
     def getEndAmount(self, org, item):
         '''获得当下的科目余额金额'''
@@ -496,37 +739,60 @@ class Account(models.Model, Glob_tag_Model):
                 amount = balance.endCamount-balance.endDamount
         return amount
 
-    def getBalanceOfVoucherPeriod(self, voucher_period, org, item):
-        '''获得指定会计期间的科目余额记录'''
-        chain = self.getChain(org, item)
-        compareMark = voucher_period.year*12+voucher_period.month
-        rs = chain.filtered(lambda r: (r.year*12+r.month) <= compareMark)
-        if len(rs) == 0:
-            balance = None
-        else:
-            balance = rs[-1]
-        return balance
+     # 获得即时本年借方累计
+
+    def getCurrentCumulativeDamount(self, org, item):
+        '''获得即时本年借方累计金额'''
+        amount = 0
+        balance = self.getBalance(org, item)
+        if balance:
+            amount = balance.cumulativeDamount
+        return amount
+
+     # 获得即时本年贷方累计
+
+    def getCurrentCumulativeCamount(self, org, item):
+        '''获得即时本年贷方累计金额'''
+        amount = 0
+        balance = self.getBalance(org, item)
+        if balance:
+            amount = balance.cumulativeCamount
+        return amount
+
+    # 获得科目在余额表中使用过的所有核算项目
 
     def getAllItemsInBalances(self):
         '''获得科目在余额表中使用过的所有核算项目'''
         if not self.accountItemClass:
             return None
-        rs = self.getBalances()
+        rs = self.getAllBalances()
         items = rs.mapped('items')
         return items
+    #  获得某机构范围内科目在余额表中使用过的所有核算项目
 
     def getAllItemsInBalancesOf(self, org):
         '''获得某机构范围内科目在余额表中使用过的所有核算项目'''
         if not self.accountItemClass:
             return None
-        rs = self.getBalances()
+        rs = self.getAllBalances()
         rs_org = rs.filtered(lambda r: r.org.id == org.id)
         items = rs_org.mapped('items')
         return items
 
+    @api.multi
+    def showInVoucher(self):
+        '''在凭证中显示'''
+        self.write({'is_show': True})
+
+    @api.multi
+    def cancelShowInVoucher(self):
+        '''取消凭证中显示'''
+        self.write({'is_show': False})
 
 # 特殊的会计科目
-class SpecialAccounts(models.Model):
+
+
+class SpecialAccounts(models.Model, Glob_tag_Model):
     '''特殊的会计科目'''
     _name = "accountcore.special_accounts"
     _description = '特殊的会计科目'
@@ -637,7 +903,7 @@ class Source(models.Model, Glob_tag_Model):
 
 
 # 记账凭证
-class Voucher(models.Model):
+class Voucher(models.Model, Glob_tag_Model):
     '''会计记账凭证'''
     _name = 'accountcore.voucher'
     _description = '会计记账凭证'
@@ -762,15 +1028,18 @@ class Voucher(models.Model):
             v.month = v.voucherdate.month
 
     @api.multi
-    def reviewing(self, ids):
+    def reviewing(self):
         '''审核凭证'''
-        self.write({'state': 'reviewed', 'reviewer': self.env.uid})
-        return False
+        vouchers = self.filtered(lambda v: not v.reviewer)
+        for v in vouchers:
+            v.write({'state': 'reviewed', 'reviewer': self.env.uid})
 
     @api.multi
-    def cancelReview(self, ids):
+    def cancelReview(self):
         '''取消凭证审核'''
-        self.write({'state': 'creating', 'reviewer': None})
+        vouchers = self.filtered(lambda v: v.reviewer.id == self.env.uid)
+        for v in vouchers:
+            v.write({'state': 'creating', 'reviewer': None})
 
     @api.model
     def create(self, values):
@@ -918,10 +1187,12 @@ class Voucher(models.Model):
     @api.model
     def _checkCDBalance(self, voucherDist):
         '''检查借贷平衡'''
-        camount = 0
-        damount = 0
-        camount = sum(entry.camount for entry in self.entrys)
-        damount = sum(entry.damount for entry in self.entrys)
+        camount = ACTools.ZeroAmount()
+        damount = ACTools.ZeroAmount()
+        camount = sum(ACTools.TranslateToDecimal(entry.camount)
+                      for entry in self.entrys)
+        damount = sum(ACTools.TranslateToDecimal(entry.damount)
+                      for entry in self.entrys)
         # if camount == damount and camount != 0:
         if camount == damount:
             return True
@@ -1151,7 +1422,7 @@ class Voucher(models.Model):
 
 
 # 分录
-class Enty(models.Model):
+class Enty(models.Model, Glob_tag_Model):
     '''一条分录'''
     _name = 'accountcore.entry'
     _description = "会计分录"
@@ -1214,7 +1485,7 @@ class Enty(models.Model):
     items_html = fields.Html(string="分录内容",
                              compute='_createItemsHtml',
                              store=True)
-
+    business = fields.Text(string='业务数据')
     @api.multi
     @api.depends('items.name', 'account_item', 'items.item_class_name')
     def _createItemsHtml(self):
@@ -1295,7 +1566,7 @@ class Enty(models.Model):
 # 凭证编号策略
 
 
-class VoucherNumberTastics(models.Model):
+class VoucherNumberTastics(models.Model, Glob_tag_Model):
     '''凭证编号的生成策略,一张凭证在不同的策略下有不同的凭证编号,自动生成凭证编号时需要指定一个策略'''
     _name = 'accountcore.voucher_number_tastics'
     _description = '凭证编号生成策略'
@@ -1387,6 +1658,30 @@ class AccountsBalance(models.Model):
                                   readonly=True,
                                   string="Currency",
                                   help='Utility field to express amount currency')
+    begin_year_amount = fields.Monetary(
+        string="年初余额", compute='_getYearBeginAmount')
+
+    @api.multi
+    @api.onchange('beginingDamount', 'beginingCamount', 'beginCumulativeDamount', 'beginCumulativeCamount')
+    def _getYearBeginAmount(self):
+        '''计算启用期的年初余额'''
+        for b in self:
+            begin_d = b.beginingDamount-b.beginCumulativeDamount
+            begin_c = b.beginingCamount-b.beginCumulativeCamount
+            if b.account.direction == '1':
+                b.begin_year_amount = begin_d-begin_c
+            else:
+                b.begin_year_amount = begin_d-begin_c
+
+    @api.onchange('beginingDamount')
+    def _damountChange(self):
+        if self.beginingDamount != 0:
+            self.beginingCamount = 0
+
+    @api.onchange('beginingCamount')
+    def _CamountChange(self):
+        if self.beginingCamount != 0:
+            self.beginingDamount = 0
 
     @api.onchange('account')
     # 改变科目时删除核算项目关联
@@ -1858,7 +2153,7 @@ class AccountsBalance(models.Model):
         '''检查以前期间是否存在凭证'''
         domain = [('org', '=', value['org']),
                   ('account', '=', value['account']),
-                  ('items', '=', value.setdefault('item', False)),
+                  ('items', '=', value.setdefault('items', False)),
                   '|', ('v_year', '<', value['year']),
                   '&', ('v_year', '=', value['year']),
                   ('v_month', '<', value['month'])]
@@ -1941,5 +2236,3 @@ class AccountBalanceMark(object):
             or (r.year == self.year
                 and r.month > self.month)))).sorted(key=lambda a: (a.year, a.month, not a.isbegining))
         return next_balanceRecords
-
-
