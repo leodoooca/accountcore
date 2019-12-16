@@ -1223,11 +1223,12 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
             };
             this.ddom = document.createElement('div');
             this.$el.append(this.ddom);
+
             // var d = self.value;
             var options = {
                 editable: (this.mode === 'edit'),
-                tableOverflow: true,
-                tableHeight: 600,
+                tableOverflow: false,
+                tableHeight: "297mm",
                 fullscreen: false,
                 defaultColWidth: 150,
                 wordWrap: true,
@@ -1262,6 +1263,7 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                         onclick: function () {
                             self.jexcel_obj.undo();
                             if (self.mode != 'edit') {
+                                self.do_notify('提示', '在编辑状态下才能操作！');
                                 return;
                             }
 
@@ -1274,6 +1276,7 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                         onclick: function () {
                             self.jexcel_obj.redo();
                             if (self.mode != 'edit') {
+                                self.do_notify('提示', '在编辑状态下才能操作！');
                                 return;
                             }
 
@@ -1338,6 +1341,7 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                         tooltip: '合并选中的单元格',
                         onclick: function () {
                             if (self.mode != 'edit') {
+                                self.do_notify('提示', '在编辑状态下才能合并选中的单元格！');
                                 return;
                             }
                             // var cell = jexcel.getColumnNameFromId([self.selection_x1, self.selection_y1])
@@ -1354,6 +1358,7 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                         tooltip: '对选中的单元格取消合并',
                         onclick: function () {
                             if (self.mode != 'edit') {
+                                self.do_notify('提示', '在编辑状态下才能取消合并！');
                                 return;
                             }
                             var cell = jexcel.getColumnNameFromId([self.selection_x1, self.selection_y1]);
@@ -1368,6 +1373,7 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                         tooltip: '设置选中单元格的公式',
                         onclick: function () {
                             if (self.mode != 'edit') {
+                                self.do_notify('提示', '在编辑状态下才能设置公式！');
                                 return;
                             }
                             self._openAccountFormulaWizard();
@@ -1429,6 +1435,24 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                         content: 'swap_vertical',
                         onclick: function () {
                             self.$el.find('.jexcel_toolbar').toggleClass('jexecl_toolbar_place');
+
+                        }
+                    },
+                    // 打印
+                    {
+                        type: 'i',
+                        tooltip: '打印',
+                        content: 'print',
+                        onclick: function () {
+                            printJS({
+                                printable: 'print_content',
+                                type: 'html',
+                                css: ['/accountcore/static/css/jsuites.css','/accountcore/static/css/jexcel.css'],
+                                scanStyles: false,
+                                ignoreElements:[],
+                                style:".jexcel_row{visibility: hidden !important;}.jexcel_toolbar{display: none !important;}table>thead{visibility: hidden !important;}",
+                            })
+
 
                         }
                     },
@@ -1635,6 +1659,8 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
 
             };
             self.jexcel_obj = jexcel(this.ddom, options);
+            // 添加ID以便打印调用
+            this.$el.find('.jexcel').attr("id","print_content");
             // 设置右键科目取数公式菜单在编辑状态下可见
             self.jexcel_obj.options.allowOpenAccountFormula = (this.mode === 'edit');
             // 设置默认行高             

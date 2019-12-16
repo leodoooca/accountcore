@@ -7,6 +7,7 @@ import logging
 import multiprocessing
 from ..models.ac_obj import ACTools
 from odoo import models, fields, api, SUPERUSER_ID, exceptions
+from odoo import tools
 import sys
 sys.path.append('.\\.\\server\\odoo')
 sys.path.append('.\\.\\')
@@ -85,7 +86,8 @@ class AccountsArch(models.Model, Glob_tag_Model):
     _name = 'accountcore.accounts_arch'
     _description = '会计科目体系'
     number = fields.Char(string='科目体系编码', required=True)
-    name = fields.Char(string='科目体系名称', required=True)
+    name = fields.Char(string='科目体系名称', required=True,
+                       help='对科目的一个分类,例如通用科目,某行业科目等')
     accounts = fields.One2many(
         'accountcore.account', 'accountsArch', string='科目')
 
@@ -101,7 +103,8 @@ class ItemClass(models.Model, Glob_tag_Model):
     _name = 'accountcore.itemclass'
     _description = '核算项目类别'
     number = fields.Char(string='核算项目类别编码', required=True)
-    name = fields.Char(string='核算项目类别名称', required=True)
+    name = fields.Char(string='核算项目类别名称', required=True,
+                       help='对核算项目的一个分类,不能重复,例如:员工,部门等')
     _sql_constraints = [('accountcore_itemclass_number_unique', 'unique(number)',
                          '核算项目类别编码重复了!'),
                         ('accountcore_itemclass_name_unique', 'unique(name)',
@@ -113,11 +116,11 @@ class Item(models.Model, Glob_tag_Model):
     '''核算项目'''
     _name = 'accountcore.item'
     _description = '核算项目'
-    org = fields.Many2one('accountcore.org',
-                          string='核算机构',
-                          help="核算项目所属核算机构",
-                          index=True,
-                          ondelete='restrict')
+    org = fields.Many2many('accountcore.org',
+                           string='所属机构',
+                           help="核算项目所属核算机构,该机构可以使用的核算项目,不选默认全部机构可用",
+                           index=True,
+                           ondelete='restrict')
     uniqueNumber = fields.Char(string='唯一编号')
     number = fields.Char(string='核算项目编码')
     name = fields.Char(string='核算项目名称',
@@ -130,6 +133,7 @@ class Item(models.Model, Glob_tag_Model):
                                 ondelete='restrict')
     item_class_name = fields.Char(related='itemClass.name',
                                   string='核算项目类别',
+                                  index=True,
                                   store=True,
                                   ondelete='restrict')
     _sql_constraints = [('accountcore_item_number_unique', 'unique(number)',
@@ -160,6 +164,15 @@ class Item(models.Model, Glob_tag_Model):
             filter_itemClass = [
                 itemclass.id for itemclass in account.itemClasses]
             args.append(('itemClass', 'in', filter_itemClass))
+        context = self.env.context
+        org_id = context.get('org_id')
+        if org_id:
+            # 修改凭证时从上下文取
+            org = org_id
+        else:
+            # 新增时从用户默认值取，凭证机构的change会触发默认值从新设置
+            org = self.env.user.currentOrg.id
+        domain = domain+['|', ('org', '=', False), ('org', 'in', [org])]
         pos = self.search(domain+args, limit=limit, order='number')
         # return pos.name_get()
         return pos._my_name_get()
@@ -276,7 +289,8 @@ class AccountClass(models.Model, Glob_tag_Model):
     _name = 'accountcore.accountclass'
     _description = '会计科目类别'
     number = fields.Char(string='科目类别编码', required=True)
-    name = fields.Char(string='科目类别名称', required=True)
+    name = fields.Char(string='科目类别名称', required=True,
+                       help='对科目的一个分类,例如：资产类,负载类')
     _sql_constraints = [('accountcore_accountclass_number_unique', 'unique(number)',
                          '科目类别编码重复了!'),
                         ('accountcore_accountclass_name_unique', 'unique(name)',
@@ -288,11 +302,11 @@ class Account(models.Model, Glob_tag_Model):
     '''会计科目'''
     _name = 'accountcore.account'
     _description = '会计科目'
-    org = fields.Many2one('accountcore.org',
-                          string='所属机构',
-                          help="科目所属机构",
-                          index=True,
-                          ondelete='restrict')
+    org = fields.Many2many('accountcore.org',
+                           string='所属机构',
+                           help="该机构可以使用的科目,不选默认全部机构可用",
+                           ondelete='restrict',
+                           index=True)
 
     accountsArch = fields.Many2one('accountcore.accounts_arch',
                                    string='所属科目体系',
@@ -405,10 +419,19 @@ class Account(models.Model, Glob_tag_Model):
         # 同时根据科目编号和名称进行搜索
         if name:
             domain = ['|', ('number', operator, name),
-                      ('name', operator, name)]
+                      ('name', operator, name), ]
         # 源代码默认为160,突破其限制   详细见 /web/static/src/js/views/form_common.js
         if limit == 160:
             limit = 0
+        context = self.env.context
+        org_id = context.get('org_id')
+        if org_id:
+            # 修改凭证时从上下文取
+            org = org_id
+        else:
+            # 新增时从用户默认值取，凭证机构的change会触发默认值从新设置
+            org = self.env.user.currentOrg.id
+        domain = domain+['|', ('org', '=', False), ('org', 'in', [org])]
         pos = self.search(domain+args, limit=limit, order='number')
         # return pos.name_get()
         return pos._my_name_get()
@@ -1625,8 +1648,8 @@ class AccountsBalance(models.Model):
                           required=True,
                           index=True)
     # 通过createDate生成,不要直接修改
-    month = fields.Integer(string='月', required=True)
-    isbegining = fields.Boolean(string="是启用期间", default=False)
+    month = fields.Integer(string='月', required=True, index=True)
+    isbegining = fields.Boolean(string="是启用期间", default=False, index=True)
     account = fields.Many2one('accountcore.account',
                               string='会计科目',
                               required=True,
@@ -1634,10 +1657,12 @@ class AccountsBalance(models.Model):
                               ondelete='cascade')
     account_number = fields.Char(related='account.number',
                                  string='科目编码',
-                                 store=True)
+                                 store=True,
+                                 index=True)
     account_class_id = fields.Many2one(related='account.accountClass',
                                        string='科目类别',
-                                       store=True)
+                                       store=True,
+                                       index=True)
     accountItemClass = fields.Many2one('accountcore.itemclass',
                                        string='核算项目类别',
                                        related='account.accountItemClass')
