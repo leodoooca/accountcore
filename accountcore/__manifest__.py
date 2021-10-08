@@ -4,12 +4,14 @@
     'summary': """
        一个独立的中国会计模块""",
     'description': """
-        和odoo自带的会计模块完全无关。以简单、直接、易用、智能为设计原则。没有繁琐的初始化和配置，不用结账和反结账、过账等冗余操作是中国会计的最佳实践。
+        会计总账和报表功能，和odoo自带的会计模块完全无关。以简单、直接、易用、智能为设计原则。没有繁琐的初始化和配置，不用结账和反结账、过账等冗余操作是中国会计的最佳实践。
     """,
     'author': "黄虎",
     'website': "",
     'category': 'accountcore',
-    'version': '0.1',
+    'version': '12.8.12.20201007_beta',
+    'price': 333.85,
+    'currency': 'USD',
     'depends': ['base', 'web'],
     'application': True,
     'license': 'LGPL-3',
@@ -27,6 +29,9 @@
         'views/assetsAdd_templates.xml',
         'security/users.xml',
         'views/views.xml',
+        'views/accounts_balance_views.xml',
+        'views/voucher_clone.xml',
+        'wizard/begin_balance_views.xml',
         'report/voucher_print_templates.xml',
         'report/account_balance_report_template.xml',
         'report/account_subsidiary_book_template.xml',
@@ -37,6 +42,9 @@
         'data/report_model.xml',
         'data/help_data.xml',
         'security/ir.model.access.csv',
+        'security/record_group_role_ac.xml',
+        'security/record_group_role_search.xml',
+        'security/record_group_system.xml',
 
     ],
     'qweb': [
@@ -50,4 +58,3 @@
         'static/css/jsuites.css',
     ],
 }
-

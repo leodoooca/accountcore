@@ -10,10 +10,9 @@ from odoo import exceptions
 from odoo import models, fields, api
 import sys
 sys.path.append('.\\.\\server')
-
-
-
 # 查询科目余额表
+
+
 class AccountBalanceReport(models.AbstractModel):
     '''科目余额表'''
     _name = 'report.accountcore.account_balance_report'
@@ -41,6 +40,7 @@ class AccountBalanceReport(models.AbstractModel):
         orgs = self.env['accountcore.org'].sudo().browse(org_id)
         # 多机构合并显示名称
         data['sum_orgs_name'] = "+".join(orgs.mapped('name'))
+        data['sum_orgids'] = org_id
         startDate = datetime.datetime.strptime(form['startDate'],
                                                '%Y-%m-%d')
         start_year = startDate.year
@@ -49,7 +49,6 @@ class AccountBalanceReport(models.AbstractModel):
                                              '%Y-%m-%d')
         end_year = endDate.year
         end_month = endDate.month
-
         # 构建查询数据库的参数
         params = (start_year,
                   start_month,
@@ -65,16 +64,14 @@ class AccountBalanceReport(models.AbstractModel):
                               start_year,
                               start_month,
                               tuple(org_id))
-
         # 用来存储余额记录的容器对象
         balances = Balances()
-
         temp_accountId = ""
         temp_itemId = ""
         temp_orgId = ""
-
         # 科目在查询期间以前的余额记录,按机构,科目,项目和年月进行了排序
         recordsBeforSart = self._getRecordsBeforStart(params_befor_start)
+        is_begining = False
         for record in recordsBeforSart:
             # if 已经对开始期间以前的最近一条相同科目和核算项目的记录取了数,就跳到下一个record(
             # 也就是取到了查询期间离期初最近的那一条余额记录,如果存在,这条记录的期初就是该科目在
@@ -82,7 +79,13 @@ class AccountBalanceReport(models.AbstractModel):
             if (record['org_id'] == temp_orgId
                 and record['account_id'] == temp_accountId
                     and record['item_id'] == temp_itemId):
-                continue
+                # 判断是否在查询开始期间之前,是之前不能取启用期初那条
+                if is_begining:
+                    if record['year'] < start_year or record['year'] == start_year and record['month'] < start_month:
+                        balances.del_(record)
+                else:
+                    continue
+            is_begining = record['isbegining']
             temp_orgId = record['org_id']
             temp_accountId = record['account_id']
             temp_itemId = record['item_id']
@@ -101,12 +104,16 @@ class AccountBalanceReport(models.AbstractModel):
                     record['beginingDamount']).quantize(Decimal('0.00'))
                 balance.beginingCamount = Decimal.from_float(
                     record['beginingCamount']).quantize(Decimal('0.00'))
+            elif record['year'] < start_year or record['year'] == start_year and record['month'] < start_month:
+                balance.beginingDamount = Decimal.from_float(
+                    record['endDamount']).quantize(Decimal('0.00'))
+                balance.beginingCamount = Decimal.from_float(
+                    record['endCamount']).quantize(Decimal('0.00'))
             else:
                 balance.beginingDamount = Decimal.from_float(
                     record['endDamount']).quantize(Decimal('0.00'))
                 balance.beginingCamount = Decimal.from_float(
                     record['endCamount']).quantize(Decimal('0.00'))
-
             balance.item_class_name = record['item_class_name']
             balance.item_id = record['item_id']
             balance.item_name = record['item_name']
@@ -140,8 +147,6 @@ class AccountBalanceReport(models.AbstractModel):
                                           one['item_id'])
                 balance_current.beginingDamount = 0
                 balance_current.beginingCamount = 0
-                # balance_current.damount = one['damount']
-                # balance_current.camount = one['camount']
                 balance_current.damount = Decimal.from_float(
                     one['damount']).quantize(Decimal('0.00'))
                 balance_current.camount = Decimal.from_float(
@@ -174,7 +179,6 @@ class AccountBalanceReport(models.AbstractModel):
             AccountsArch_filter_includeAccountItems(includeAccountItems),
             AccountsArch_filter_order_orgs(order_orgs),
             AccountsArch_filter_sum_orgs(sum_orgs))
-
         return {'lines': lines,
                 'docs': accountsArchWithItems,
                 'data': data}
@@ -193,9 +197,9 @@ class AccountBalanceReport(models.AbstractModel):
                         "beginingDamount",
                         "beginingCamount",
                         "endDamount",
-                        "endCamount"
+                        "endCamount",
+                        isbegining
                     FROM
-
                         (SELECT
                             year,
                             month,
@@ -224,7 +228,7 @@ class AccountBalanceReport(models.AbstractModel):
                               item_id,
                               year desc ,
                               month desc,
-                              isbegining desc'''
+                              isbegining asc'''
         self.env.cr.execute(query, params)
         return self.env.cr.dictfetchall()
 
@@ -266,8 +270,7 @@ class AccountBalanceReport(models.AbstractModel):
 
     def _getAccountAcrch(self):
         '''获得科目表结构对象'''
-        query = '''SELECT t_org.id as account_org_id,
-                    t_org.name  as account_org_name,
+        query = '''SELECT
                     null as org_id,
                     '' as org_name,
                     t_account."fatherAccountId" as account_father_id,
@@ -283,8 +286,6 @@ class AccountBalanceReport(models.AbstractModel):
                     CAST(0 as numeric)  as damount,
                     CAST(0 as numeric)  as camount
                 FROM accountcore_account AS t_account
-                LEFT OUTER JOIN accountcore_org as t_org
-                ON t_account.org=t_org.id
                 LEFT OUTER JOIN accountcore_accountClass as t_account_class
                 ON t_account."accountClass"=t_account_class.id
                 ORDER BY account_number'''
@@ -301,13 +302,12 @@ class AccountBalanceReport(models.AbstractModel):
                 virtualAccount['account_father_id'] = x['account_id']
                 virtualAccount['is_virtual'] = True
                 virtualAccount['is_last'] = True
-                virtualAccount['account_name'] = x['account_name']+"*"
+                virtualAccount['account_name'] = x['account_name']+"▲"
                 virtual_accounts.append(virtualAccount)
-
         return rl+virtual_accounts
-
-
 # 一条余额记录
+
+
 class Balance(object):
     '''一条余额记录'''
     __slots__ = ['org_id',
@@ -361,9 +361,9 @@ class Balance(object):
 
     def __getitem__(self, item):
         return getattr(self, item)
-
-
 # 余额记录的明细容器
+
+
 class Balances(object):
     '''余额记录的明细容器'''
 
@@ -390,8 +390,16 @@ class Balances(object):
         '''获得balance的列表形式'''
         return self.org_account_items.values()
 
+    def del_(self, balance):
+        '''删除'''
+        mark = str(balance['org_id'])+'.' \
+            + str(balance['account_id']) + "-" \
+            + str(balance['item_id'])
+        del self.org_account_items[mark]
 
 # 科目余额管理器
+
+
 class AccountsArchManager(object):
     '''科目余额管理器'''
 
@@ -419,13 +427,15 @@ class AccountsArchManager(object):
                               balance.damount,
                               balance.camount)
         # if有上级科目，下级科目金额合并到上级科目
-        if accountArch.father_id:
-            fatherAccount = self._getFatherAccountById(accountArch.father_id,
+        fathId = accountArch.father_id
+        while fathId:
+            fatherAccount = self._getFatherAccountById(fathId,
                                                        balance.org_id)
             fatherAccount.addAmount(balance.beginingDamount,
                                     balance.beginingCamount,
                                     balance.damount,
                                     balance.camount)
+            fathId = fatherAccount.father_id
         return accountArch
 
     def _getAccountArchById(self, account_id, org_id):
@@ -459,9 +469,9 @@ class AccountsArchManager(object):
         '''根据某字段排序'''
         return self.accountsArch.sort(key=lambda t: t['account_number'],
                                       reverse=reverse_it)
-
-
 # 科目余额管理器管理对象
+
+
 class AccountArch(object):
     '''科目余额管理器管理对象'''
 
@@ -490,8 +500,6 @@ class AccountArch(object):
 
     def update(self, balance):
         self.account.update(dict(balance))
-
-
 # 筛选定义-开始
 # 筛选机构
 
@@ -506,9 +514,9 @@ class AccountsArch_filter_org(object):
         newAccountsArch = [a for a in accountsArch
                            if a['org_id'] in self.__org_ids]
         return newAccountsArch
-
-
 # 筛选科目
+
+
 class AccountsArch_filter_accounts(object):
     '''筛选科目'''
 
@@ -519,9 +527,9 @@ class AccountsArch_filter_accounts(object):
         newAccountsArch = [a for a in accountsArch
                            if a['account_id'] in self.__account_ids]
         return newAccountsArch
-
-
 # 无金额不显示
+
+
 class AccountsArch_filter_noShowNoAmount(object):
     '''无金额不显示'''
 
@@ -537,9 +545,9 @@ class AccountsArch_filter_noShowNoAmount(object):
             return newAccountsArch
         else:
             return accountsArch
-
-
 # 余额为零不显示
+
+
 class AccountsArch_filter_noShowZeroBalance(object):
     '''余额为零不显示'''
 
@@ -556,9 +564,9 @@ class AccountsArch_filter_noShowZeroBalance(object):
             return newAccountsArch
         else:
             return accountsArch
-
-
 # 不显示无发生额的科目
+
+
 class AccountsArch_filter_no_show_no_hanppend(object):
     '''不显示无发生额的科目'''
 
@@ -573,9 +581,9 @@ class AccountsArch_filter_no_show_no_hanppend(object):
             return newAccountsArch
         else:
             return accountsArch
-
-
 # 只显示一级科目
+
+
 class AccountsArch_filter_onlyShowOneLevel(object):
     '''只显示一级科目'''
 
@@ -591,9 +599,9 @@ class AccountsArch_filter_onlyShowOneLevel(object):
             return newAccountsArch
         else:
             return accountsArch
-
-
 # 不显示核算项目
+
+
 class AccountsArch_filter_includeAccountItems(object):
     '''不显示核算项目'''
 
@@ -608,9 +616,9 @@ class AccountsArch_filter_includeAccountItems(object):
                                if ('item_id' not in a
                                    or not a['item_id'])]
             return newAccountsArch
-
-
 # 多机构分开显示
+
+
 class AccountsArch_filter_order_orgs(object):
     '''多机构分开显示'''
 
@@ -622,12 +630,11 @@ class AccountsArch_filter_order_orgs(object):
             accountsArch.sort(key=lambda t: (t['org_id'],
                                              t['account_number']))
             return accountsArch
-
         else:
             return accountsArch
-
-
 # 多机构合并显示
+
+
 class AccountsArch_filter_sum_orgs(object):
     '''多机构合并显示'''
 
@@ -639,18 +646,15 @@ class AccountsArch_filter_sum_orgs(object):
             return accountsArch
         else:
             accountsArch.sort(key=lambda t: (
-                t['account_number'],t['account_name'], t.setdefault('item_id', 0)))
+                t['account_number'], t['account_name'], t.setdefault('item_id', 0)))
             newAccountsArch = []
             a_temp = ""
             for a in accountsArch:
                 add = False
                 if a_temp == "":
                     add = True
-                # elif a_temp['account_id'] != a['account_id']:
-                #     add = True
-                # elif a_temp['account_id'] == a['account_id']:
                 elif a_temp['account_name'] != a['account_name']:
-                        add = True
+                    add = True
                 elif a_temp['account_name'] == a['account_name']:
                     # 存在核算项目
                     if a_temp['item_id'] != 0:
@@ -671,5 +675,4 @@ class AccountsArch_filter_sum_orgs(object):
                     a_temp['damount'] += a['damount']
                     a_temp['camount'] += a['camount']
             return newAccountsArch
-
 # 筛选定义-结束

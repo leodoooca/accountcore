@@ -5,16 +5,17 @@ import datetime
 import decimal
 import json
 import time
+import re
 from odoo import exceptions
 from odoo import models, fields, api
 from odoo import http
+from ..models.ac_obj import ACTools
 from ..models.ac_period import Period
-from ..models.main_models import VoucherNumberTastics
 import sys
 sys.path.append('.\\.\\server')
-
-
 # 查询明细账
+
+
 class SubsidiaryBook(models.AbstractModel):
     '''查询明细账'''
     _name = 'report.accountcore.subsidiary_book_report'
@@ -27,15 +28,12 @@ class SubsidiaryBook(models.AbstractModel):
         period = Period(form['startDate'],
                         form['endDate'])
         org_ids = form['orgs']
-        tasticsTypes = self.env['accountcore.voucher_number_tastics'].sudo(
-        ).search([('id', '!=', 0)])
         account_ids = form['account']
         # 存放每个科目明细账的容器
         multi_entrys = []
         # 对每一个科目生成明细账
         for account_id in account_ids:
             item = form['item']
-            self.voucher_number_tastics_id = form['voucher_number_tastics'][0]
             # 向导中选择的科目
             main_account = self.env['accountcore.account'].sudo().search(
                 [('id', '=', account_id)])
@@ -84,10 +82,9 @@ class SubsidiaryBook(models.AbstractModel):
                                      period,
                                      beginingOfYearBalance,
                                      beginBlances,
-                                     entryArchs,
-                                     tasticsTypes,
-                                     self.voucher_number_tastics_id)
+                                     entryArchs)
             multi_entrys.append(entrys)
+        data["period"] = period
         return {'doc_ids': docids,
                 'docs': multi_entrys,
                 'data': data}
@@ -117,7 +114,7 @@ class SubsidiaryBook(models.AbstractModel):
                                   item_id,
                                   year desc,
                                   month desc,
-                                  isbegining desc'''
+                                  isbegining asc'''
         # elif 在向导中选择了核算项目
         elif len_parmas == 4:
             query = ''' SELECT
@@ -141,10 +138,9 @@ class SubsidiaryBook(models.AbstractModel):
                                   item_id,
                                   year desc,
                                   month desc,
-                                  isbegining desc'''
+                                  isbegining asc'''
         else:
             raise exceptions.ValidationError('查询参数数量错误!')
-
         self.env.cr.execute(query, params)
         records = self.env.cr.dictfetchall()
         temp_accountId = ""
@@ -168,6 +164,7 @@ class SubsidiaryBook(models.AbstractModel):
                 temp_orgId = record['org_id']
                 temp_accountId = record['account_id']
                 temp_itemId = record['item_id']
+
         # 求和,得出年初余额
         return (sum(d), sum(c))
 
@@ -215,7 +212,6 @@ class SubsidiaryBook(models.AbstractModel):
                         GROUP BY year, month '''
         else:
             raise exceptions.ValidationError('查询参数数量错误!')
-
         self.env.cr.execute(query, params)
         beginRecords = self.env.cr.dictfetchall()
         return beginRecords
@@ -223,7 +219,6 @@ class SubsidiaryBook(models.AbstractModel):
     def build_entryArchs(self, entrys):
         '''构建明细记录'''
         # 选择的凭证编号策略
-        tastics_id = self.voucher_number_tastics_id
         # 对数据库取得的明细数据转化为对象列表
         entryArchs = []
         for entry in entrys:
@@ -234,10 +229,7 @@ class SubsidiaryBook(models.AbstractModel):
             entry_arch.year = entry['year']
             entry_arch.month = entry['month']
             entry_arch.org_name = entry['org_name']
-            entry_arch.numberTasticsContainer_str = entry['numberTasticsContainer_str']
-            entry_arch.number = VoucherNumberTastics.get_number(
-                entry['numberTasticsContainer_str'],
-                tastics_id)
+            entry_arch.v_number = entry['v_number']
             entry_arch.uniqueNumber = entry['uniqueNumber']
             entry_arch.roolbook_html = entry['roolbook_html']
             entry_arch.explain = entry['explain']
@@ -245,7 +237,8 @@ class SubsidiaryBook(models.AbstractModel):
             entry_arch.account_name = entry['account_name']
             entry_arch.damount = entry['damount']
             entry_arch.camount = entry['camount']
-            entry_arch.items_html = entry['items_html']
+            entry_arch.items_html = re.sub(
+                r'<br>|<p>|</p>', '', entry['items_html'])
             entry_arch.direction = entry['direction']
             entry_arch.cash_flow = entry['cash_flow']
             entryArchs.append(entry_arch)
@@ -260,7 +253,7 @@ class SubsidiaryBook(models.AbstractModel):
                     voucherdate,
                     t_voucher.year as year,
                     t_voucher.month as month,
-                    t_voucher."numberTasticsContainer_str" as "numberTasticsContainer_str",
+                    t_voucher.v_number as v_number,
                     "uniqueNumber",
                     t_voucher.roolbook_html as roolbook_html,
                     t_org.id as org_id,
@@ -283,7 +276,7 @@ class SubsidiaryBook(models.AbstractModel):
                      AND year*12+month<=%s*12+%s
                      AND t_voucher.org in %s
                      AND t_entry.account in %s
-                ORDER BY voucherdate,org_name,account_number
+                ORDER BY voucherdate,org_name,account_number,t_entry.v_number
                 '''
         elif len_parmas == 7:
             query = '''SELECT
@@ -291,7 +284,7 @@ class SubsidiaryBook(models.AbstractModel):
                     voucherdate,
                     t_voucher.year as year,
                     t_voucher.month as month,
-                    t_voucher."numberTasticsContainer_str" as "numberTasticsContainer_str",
+                    t_voucher.v_number as v_number,
                     "uniqueNumber",
                     t_voucher.roolbook_html as roolbook_html,
                     t_org.id as org_id,
@@ -315,16 +308,15 @@ class SubsidiaryBook(models.AbstractModel):
                     AND t_voucher.org in %s
                     AND t_entry.account in %s
                     AND t_entry.account_item = %s
-                ORDER BY voucherdate,org_name,account_number
+                ORDER BY voucherdate,org_name,account_number,t_entry.v_number
                 '''
         else:
             raise exceptions.ValidationError('查询参数数量错误!')
-
         self.env.cr.execute(query, params)
         return self.env.cr.dictfetchall()
-
-
 # 明细账明细
+
+
 class EntryArch(object):
     '''明细账明细'''
     __slots__ = ['voucher_id',
@@ -332,7 +324,7 @@ class EntryArch(object):
                  'voucherdate',
                  'year',
                  'month',
-                 'numberTasticsContainer_str',
+                 "v_number",
                  'number',
                  'uniqueNumber',
                  'roolbook_html',
@@ -357,8 +349,7 @@ class EntryArch(object):
         self.voucherdate = None
         self.year = 0
         self.month = 0
-        self.numberTasticsContainer_str = '{}'
-        self.number = ''
+        self.v_number = ''
         self.uniqueNumber = ""
         self.roolbook_html = ""
         self.org_name = ''
@@ -375,9 +366,9 @@ class EntryArch(object):
         self.cash_flow = ''
         self.is_not_begining = True
         self.is_PrebeginBalance = False
-
-
 # 年初余额
+
+
 class BeginYear(EntryArch):
     '''年初余额'''
 
@@ -392,15 +383,15 @@ class BeginYear(EntryArch):
         self.balance_c = camount
         self.balance = (
             damount-camount) if direction == '1' else (camount-damount)
-
-
 # 启用期初
+
+
 class BeginBalance(EntryArch):
-    '''启用期初'''
+    '''月初到启用日'''
 
     def __init__(self, year, month, direction, damount, camount):
         super(BeginBalance, self).__init__()
-        self.explain = '启用期初'
+        self.explain = '月初到启用日'
         self.year = year
         self.month = month
         self.direction = direction
@@ -408,16 +399,16 @@ class BeginBalance(EntryArch):
         self.damount = damount
         self.camount = camount
         self.is_not_begining = False
+# 启用月初以前
 
 
-# 启用期初以前
 class PrebeginBalance(EntryArch):
-    '''启用期初以前'''
+    '''启用月初以前'''
 
     def __init__(self, year, month, direction, damount, camount):
         super(PrebeginBalance, self).__init__()
         # 不要改变名称，在
-        self.explain = '年初至启用期'
+        self.explain = '年初至启用月初'
         self.year = year
         self.month = month
         self.direction = direction
@@ -426,13 +417,13 @@ class PrebeginBalance(EntryArch):
         self.camount = camount
         self.is_not_begining = False
         self.is_PrebeginBalance = True
-
-
 # 本月合计
+
+
 class SumMonth(EntryArch):
     '''本月合计'''
 
-    def __init__(self, year, month, direction, damount, camount):
+    def __init__(self, year, month, direction, damount, camount, balance=0):
         super(SumMonth, self).__init__()
         self.explain = '本月合计'
         self.voucherdate = year
@@ -441,13 +432,14 @@ class SumMonth(EntryArch):
         self.direction = direction
         self.damount = damount
         self.camount = camount
-
-
+        self.balance = balance
 # 本年累计
+
+
 class CumulativeYear(EntryArch):
     '''本年累计'''
 
-    def __init__(self, year, month, direction, damount, camount):
+    def __init__(self, year, month, direction, damount, camount, balance=0):
         super().__init__()
         self.explain = '本年累计'
         self.year = year
@@ -456,9 +448,10 @@ class CumulativeYear(EntryArch):
         self.direction = direction
         self.damount = damount
         self.camount = camount
-
-
+        self.balance = balance
 # 明细账组装器
+
+
 class EntrysAssembler():
     '''明细账组装器'''
 
@@ -468,25 +461,25 @@ class EntrysAssembler():
                  period=None,
                  beginingOfYearBalance=None,
                  beginBalances=None,
-                 entryArchs=None,
-                 tasticsTypes=None,
-                 voucher_number_tastics_id=None):
+                 entryArchs=None):
         self.main_account = main_account
         self.item = item
         self.period = period
         self.beginingOfYearBalance = beginingOfYearBalance
         self.beginBalances = beginBalances
         self.entryArchs = entryArchs
-        self.tasticsTypes = tasticsTypes
-        self.default_tastics = voucher_number_tastics_id
         self.entrys = []
+        self._generating(period)
 
-        self._generating()
-
-    def _generating(self):
+    def _generating(self, period):
         '''生成明细账'''
         self._addBegingBalance()
         if len(self.entryArchs) == 0:
+            # 添加年初余额
+            self.entrys.append(BeginYear(period.start_year,
+                                         self.main_account.direction,
+                                         self.beginingOfYearBalance[0],
+                                         self.beginingOfYearBalance[1]))
             return
         # 查询范围内有启用期初,就添加启用期初,因为如果启用期初有当月已发生额,需要计入当月发生额
         tmp_year = self.entryArchs[0].year
@@ -501,13 +494,10 @@ class EntrysAssembler():
         # 每年年初,没考虑查询期间有启用期初的
         tmp_begin_year_d = self.beginingOfYearBalance[0]
         tmp_begin_year_c = self.beginingOfYearBalance[1]
-
         # 查询期间启用期初记录的本年累计和期初余额对年初借贷方的影响
         thisYearbegins = list(
             filter(lambda b: b['year'] == tmp_year, self.beginBalances))
         # 启用期初对年初借方影响
-        # d = sum([b['begin_d']-b['cumulative_d']+b['damount']
-        #          for b in thisYearbegins])
         d = sum([b['begin_d']-b['cumulative_d']+b['damount']
                  for b in thisYearbegins])
         tmp_begin_year_d = tmp_begin_year_d+d
@@ -515,7 +505,6 @@ class EntrysAssembler():
         c = sum([b['begin_c']-b['cumulative_c']+b['camount']
                  for b in thisYearbegins])
         tmp_begin_year_c = tmp_begin_year_c+c
-
         # 调整后的年初余额
         tmp_pre_blanace = tmp_begin_year_d-tmp_begin_year_c
         # 添加年初余额
@@ -523,34 +512,29 @@ class EntrysAssembler():
                                      self.main_account.direction,
                                      tmp_begin_year_d,
                                      tmp_begin_year_c))
-
         # entryArchs必须已经按年月进行了升序排列,查询期间的各月启用期初记录被看做一条分录
         # 启用期初的"当月已反生额的借贷方"被看做一条分录的借贷方
         for e in self.entryArchs:
             if main_direction != e.direction:
                 raise exceptions.ValidationError(
-                    e.name+"科目默认余额方向和"+self.main_account.name+"的方向不一致")
-
+                    e.account_name+"科目默认余额方向和"+self.main_account.name+"的方向不一致")
             # 新的一年开始
             if e.year != tmp_year:
-                # if tmp_month == 12:
-                # if True:
                 # 添加查询期间最后的本月合计
                 self.entrys.append(SumMonth(tmp_year,
                                             tmp_month,
                                             main_direction,
                                             sum_month_d,
-                                            sum_month_c))
+                                            sum_month_c, self.entrys[-1].balance))
                 # 添加本年累计
                 self.entrys.append(CumulativeYear(tmp_year,
                                                   tmp_month,
                                                   main_direction,
                                                   sum_year_d,
-                                                  sum_year_c))
+                                                  sum_year_c, self.entrys[-1].balance))
                 # 添加年初余额
                 tmp_begin_year_d = tmp_begin_year_d+sum_year_d
                 tmp_begin_year_c = tmp_begin_year_c+sum_year_c
-
                 thisYearbegins = list(
                     filter(lambda b: b['year'] == e.year, self.beginBalances))
                 # 启用期初对年初借方影响
@@ -561,25 +545,26 @@ class EntrysAssembler():
                 c = sum([b['begin_c']-b['cumulative_c']+b['camount']
                          for b in thisYearbegins])
                 tmp_begin_year_c = tmp_begin_year_c+c
-
                 self.entrys.append(BeginYear(e.year,
                                              main_direction,
                                              tmp_begin_year_d,
                                              tmp_begin_year_c))
-
                 sum_year_d = 0
                 sum_year_c = 0
                 sum_month_d = 0
                 sum_month_c = 0
-
                 tmp_year = e.year
                 tmp_month = e.month
             if e.year == tmp_year and e.month == tmp_month:
                 # 依据余额方向更新余额记
                 if main_direction == '1':
                     e.balance = tmp_pre_blanace+e.damount-e.camount
+                    if ACTools.TranslateToDecimal(e.balance) == ACTools.ZeroAmount():
+                        e.balance = 0.00
                 elif main_direction == '-1':
                     e.balance = -tmp_pre_blanace-e.damount+e.camount
+                    if ACTools.TranslateToDecimal(e.balance) == ACTools.ZeroAmount():
+                        e.balance = 0.00
                 tmp_pre_blanace = tmp_pre_blanace+e.damount-e.camount
                 self.entrys.append(e)
                 if not e.is_PrebeginBalance:
@@ -587,53 +572,52 @@ class EntrysAssembler():
                     sum_month_c = sum_month_c+e.camount
                 sum_year_d = sum_year_d+e.damount
                 sum_year_c = sum_year_c+e.camount
-
             if (e.year == tmp_year and e.month != tmp_month):
                 # 添加本月合计
                 self.entrys.append(SumMonth(tmp_year,
                                             tmp_month,
                                             main_direction,
                                             sum_month_d,
-                                            sum_month_c))
+                                            sum_month_c, self.entrys[-1].balance))
                 # 添加本年累计
                 self.entrys.append(CumulativeYear(tmp_year,
                                                   tmp_month,
                                                   main_direction,
                                                   sum_year_d,
-                                                  sum_year_c))
+                                                  sum_year_c, self.entrys[-1].balance))
                 # 一个月结束,本月合计清零
                 sum_month_d = 0
                 sum_month_c = 0
-
                 # 依据余额方向更新余额记
                 if main_direction == '1':
                     e.balance = tmp_pre_blanace+e.damount-e.camount
+                    if ACTools.TranslateToDecimal(e.balance) == ACTools.ZeroAmount():
+                        e.balance = 0.00
                 elif main_direction == '-1':
                     e.balance = -tmp_pre_blanace-e.damount+e.camount
+                    if ACTools.TranslateToDecimal(e.balance) == ACTools.ZeroAmount():
+                        e.balance = 0.00
                 tmp_pre_blanace = tmp_pre_blanace+e.damount-e.camount
                 self.entrys.append(e)
-
                 if not e.is_PrebeginBalance:
                     sum_month_d = sum_month_d+e.damount
                     sum_month_c = sum_month_c+e.camount
                 sum_year_d = sum_year_d+e.damount
                 sum_year_c = sum_year_c+e.camount
-
             tmp_year = e.year
             tmp_month = e.month
-
         # 添加查询期间最后的本月合计
         self.entrys.append(SumMonth(tmp_year,
                                     tmp_month,
                                     main_direction,
                                     sum_month_d,
-                                    sum_month_c))
+                                    sum_month_c, self.entrys[-1].balance))
         # 添加本年累计
         self.entrys.append(CumulativeYear(tmp_year,
                                           tmp_month,
                                           main_direction,
                                           sum_year_d,
-                                          sum_year_c))
+                                          sum_year_c, self.entrys[-1].balance))
 
     def _addBegingBalance(self):
         '''把查询期间的启用期初加入分录列表'''

@@ -1,6 +1,69 @@
+//导出数据用
+odoo.define('accountcore.DataExport', ['web.core', 'web.crash_manager', 'web.framework', 'web.py_utils', 'web.DataExport'], function (require) {
+    "use strict";
+    var crash_manager = require('web.crash_manager');
+    var framework = require('web.framework');
+    var pyUtils = require('web.py_utils');
+    var dataExport = require('web.DataExport');
+    var acExport = dataExport.extend({
+        // 从odoo13的相同模块_exportData
+        export: function (export_format) {
+            var self = this;
+            let exported_fields = this.defaultExportFields.map(field => ({
+                name: field,
+                label: this.record.fields[field].string,
+            }));
+            framework.blockUI();
+            var idsToExport = self.getParent().getSelectedIds();
+            this.ids_to_export = idsToExport ? idsToExport : false;
+            var domain = self.record.domain;
+            this.getSession().get_file({
+                url: '/web/export/' + export_format,
+                data: {
+                    data: JSON.stringify({
+                        model: this.record.model,
+                        fields: exported_fields,
+                        ids: this.ids_to_export,
+                        domain: domain,
+                        context: pyUtils.eval('contexts', [this.record.getContext()]),
+                        import_compat: false,
+                    })
+                },
+                complete: framework.unblockUI,
+                error: crash_manager.rpc_error.bind(crash_manager),
+            });
+        },
+    })
+    return acExport;
+});
+//列表视图导出excel的小部件(按钮)
+odoo.define("accountcore.list2excel", function (require) {
+    "use strict";
+    var Widget = require('web.Widget');
+    var btn = Widget.extend({
+        template: 'accountcore.list2excel_t',
+        events: {
+            'click': '_click',
+        },
+        _click: function () {
+            this.trigger_up('ac_down_excel', {
+                'url_suffix': this.url_suffix
+            });
+        },
+        init: function (parent, url_suffix) {
+            // 访问后台控制的路由后缀
+            this.url_suffix = url_suffix;
+            this._super.apply(this, arguments);
+        },
+    });
+    return btn;
+});
 // 猴子补丁，改变基类，
-odoo.define('accountcore.basechange', ['web.AbstractField'], function (require) {
+odoo.define('accountcore.basechange', ['web.AbstractField', 'web.ListController', 'accountcore.DataExport', 'accountcore.list2excel'], function (require) {
     var basic_fields = require('web.AbstractField');
+    var ListController = require('web.ListController');
+    var DataExport = require('accountcore.DataExport');
+    var list2excel = require('accountcore.list2excel');
     // 交换默认的回车和tab键
     basic_fields.include({
         _onKeydown: function (ev) {
@@ -52,14 +115,118 @@ odoo.define('accountcore.basechange', ['web.AbstractField'], function (require) 
                     break;
             }
         },
-
     });
+    //列表视图导出excel的按钮(accountcore.list2excel)调用
+    ListController.include({
+        custom_events: _.extend({}, ListController.prototype.custom_events, {
+            ac_down_excel: '_ac_getExportDialogWidge',
+        }),
+        _ac_getExportDialogWidge: function (args) {
+            let state = this.model.get(this.handle);
+            let defaultExportFields = this.renderer.columns.filter(field => field.tag === 'field').map(field => field.attrs.name);
+            let groupedBy = this.renderer.state.groupedBy;
+            let dataExport = new DataExport(this, state, defaultExportFields, groupedBy,
+                this.getActiveDomain(), this.getSelectedIds());
+            dataExport.export(args.data['url_suffix']);
+        },
+        renderButtons: function ($node) {
+            this._super.apply(this, arguments);
+            if (this.$buttons) {
+                var _url_suffix = "xls";
+                if (this.ac_url_suffix) {
+                    _url_suffix = this.ac_url_suffix
+                };
+                var btns = this.$buttons;
+                var btn_excel = new list2excel(this, _url_suffix);
+                btn_excel.appendTo(btns)
+            }
+        }
+    });
+
 });
-// 凭证借贷方金额
+
+// 凭证科目选择字段小部件
+odoo.define('accountcore.voucher_account', ['web.core','web.relational_fields', 'web.field_registry','web.view_dialogs'], function (require) {
+    var relational_fields = require('web.relational_fields');
+    var FieldMany2One = relational_fields.FieldMany2One;
+    var core = require('web.core');
+    var dialogs = require('web.view_dialogs');
+    var _t = core._t;
+    var ChoiceAccountMany2one = FieldMany2One.extend({
+        /**
+         * 继承重写方法,该方法调出调出搜索更多...的列表窗体
+         * @param  {any} view 这里'seach'
+         * @param  {any} ids 列表中展现的记录ID
+         * @param  {any} context 上下文
+         * @param  {any} dynamicFilters 
+         * @return 
+         */
+        _searchCreatePopup: function (view, ids, context) {
+            // 科目字段选择小部件的上级(分录)的上级(凭证)小部件的核算机构的ID
+            var org_id = 0
+            if (this.__parentedParent.__parentedParent.recordData.org) {
+                org_id = this.__parentedParent.__parentedParent.recordData.org.data.id
+            }
+            // var org_id = this.__parentedParent.__parentedParent.recordData.org.data.id
+            var self = this;
+            // 在凭证科目选择字段,点击搜索更多打开的科目列表,默认只出现凭证上
+            // 核算机构范围类的科目和没有分配给任何核算机构的科目
+            var domain=this.record.getDomain({fieldName: this.name});
+            domain.push('|',['org','in',org_id],['org','=',false]);
+            return new dialogs.SelectCreateDialog(this, _.extend({}, this.nodeOptions, {
+                res_model: this.field.relation,
+                domain: domain,
+                context: _.extend({}, this.record.getContext(this.recordParams), context || {}),
+                title: (view === 'search' ? _t("Search: ") : _t("Create: ")) + this.string,
+                initial_ids: ids ? _.map(ids, function (x) { return x[0]; }) : undefined,
+                initial_view: view,
+                disable_multiple_selection: true,
+                no_create: !self.can_create,
+                on_selected: function (records) {
+                    self.reinitialize(records[0]);
+                    self.activate();
+                }
+            })).open();
+        },
+        // _getSearchCreatePopupOptions(view, ids, context, dynamicFilters){
+        //     // 科目字段选择小部件的上级(分录)的上级(凭证)小部件的核算机构的ID
+        //     var org_id=this.__parentedParent.__parentedParent.recordData.org.data.id
+        //     var self = this;
+        //     // 在凭证科目选择字段,点击搜索更多打开的科目列表,默认只出现凭证上
+        //     // 核算机构范围类的科目和没有分配给任何核算机构的科目
+        //     var domain=this.record.getDomain({fieldName: this.name});
+        //     domain.push('|',['org','in',org_id],['org','=',false]);
+        //     return {
+        //         res_model: this.field.relation,
+        //         domain: domain,
+        //         // 重写
+        //         context: _.extend({}, this.record.getContext(this.recordParams), context || {}),
+        //         dynamicFilters: dynamicFilters || [],
+        //         title: (view === 'search' ? _t("Search: ") : _t("Create: ")) + this.string,
+        //         initial_ids: ids,
+        //         initial_view: view,
+        //         disable_multiple_selection: true,
+        //         no_create: !self.can_create,
+        //         kanban_view_ref: this.attrs.kanban_view_ref,
+        //         on_selected: function (records) {
+        //             self.reinitialize(records[0]);
+        //         },
+        //         on_closed: function () {
+        //             self.activate();
+        //         },
+        //     };
+        // },
+    });
+    var fieldRegistry = require('web.field_registry');
+    fieldRegistry.add('ChoiceAccountMany2one', ChoiceAccountMany2one);
+    return {
+        ChoiceAccountMany2one: ChoiceAccountMany2one,
+    }
+});
+// 凭证借贷方金额颜色
 odoo.define('accountcore.accountcoreListRenderer', function (require) {
     "use strict";
     var ListRenderer = require('web.ListRenderer');
-
     ListRenderer.include({
         events: _.extend({}, ListRenderer.prototype.events, {
             'change table td.voucher_d_amount': '_entryamountChange',
@@ -101,7 +268,6 @@ odoo.define('accountcore.accountcoreListRenderer', function (require) {
         }
         return node;
     };
-
     //含有类
     function _hasClass(td, className) {
         if (td.hasClass(className)) {
@@ -119,14 +285,12 @@ odoo.define('web.accountcoreExtend', ['web.basic_fields', 'web.relational_fields
     var accountcoreVoucher = require('accountcore.accountcoreVoucher');
     var FieldChar = require('web.basic_fields').FieldChar;
     var tiger_accountItems_m2m = fieldMany2ManyTags.extend({
-
         activate: function () {
             return this.choiceItemsModel ? this.choiceItemsModel.activate() : false;
         },
         getFocusableElement: function () {
             return this.choiceItemsModel ? this.choiceItemsModel.getFocusableElement() : $();
         },
-
         /**
          * @private
          */
@@ -169,7 +333,6 @@ odoo.define('web.accountcoreExtend', ['web.basic_fields', 'web.relational_fields
                 if (id && id > 0 && id != newValue.id) {
                     this._removeTag(id);
                 }
-
                 ev.target.ac_itemId = newValue.id;
                 ev.target.ac_itemName = newValue.display_name;
                 //重要覆写
@@ -182,11 +345,9 @@ odoo.define('web.accountcoreExtend', ['web.basic_fields', 'web.relational_fields
             }
             ev.target.ac_itemId = null;
             ev.target.ac_itemName = null;
-
             //重要覆写
             ev.stopPropagation();
         },
-
     });
     var FieldChar_voucher_explain = FieldChar.extend({
         events: _.extend({}, FieldChar.prototype.events, {
@@ -213,28 +374,23 @@ odoo.define('web.accountcoreExtend', ['web.basic_fields', 'web.relational_fields
         _autoBalance: function (self_tr) {
             var damount_input = self_tr.find("[name='damount']").find("input");
             var camount_input = self_tr.find("[name='camount']").find("input");
-            // var dsum = $("[title='ac_dsum']");
-            // var csum = $("[title='ac_csum']");
             var amount = $("[name='sum_amount']span").text().replace(/,/gi, '');
-            // var amount = dsum.text().replace(/,/gi, '') - csum.text().replace(/,/gi, '');
             var old_amount = damount_input.val().replace(/,/gi, '') - camount_input.val().replace(/,/gi, '');
             if (old_amount == 0) {
                 if (amount > 0) {
                     camount_input.val(amount);
                     camount_input.trigger('input');
+                    camount_input.trigger('change');
                 } else if (amount < 0) {
                     damount_input.val(-amount);
                     damount_input.trigger('input');
+                    damount_input.trigger('change');
                 };
             };
-
         },
     });
-
     var FieldMany2ManyCheckBoxes = relational_fields.FieldMany2ManyCheckBoxes;
     var FieldMany2ManyCheckBoxes_flowToLeft = FieldMany2ManyCheckBoxes.extend({
-
-
         template: 'FieldMany2ManyCheckBoxes_flowToLeft',
     });
     var fieldRegistry = require('web.field_registry');
@@ -242,7 +398,6 @@ odoo.define('web.accountcoreExtend', ['web.basic_fields', 'web.relational_fields
     // 继承many2many_checkboxes向左浮动
     fieldRegistry.add('many2many_checkboxes_floatleft', FieldMany2ManyCheckBoxes_flowToLeft);
     fieldRegistry.add('FieldChar_voucher_explain', FieldChar_voucher_explain);
-
     return {
         tiger_accountItems_m2m: tiger_accountItems_m2m,
         fieldMany2ManyCheckBoxes_flowToLeft: FieldMany2ManyCheckBoxes_flowToLeft,
@@ -250,23 +405,19 @@ odoo.define('web.accountcoreExtend', ['web.basic_fields', 'web.relational_fields
     };
 });
 //凭证的核算项目字段选择
-odoo.define('accountcore.accountcoreVoucher', ['web.AbstractField', 'web.relational_fields', 'web.field_registry', 'web.core', 'web.field_utils'], function (require) {
+odoo.define('accountcore.accountcoreVoucher', ['web.AbstractField', 'web.relational_fields', 'web.field_registry', 'web.core'], function (require) {
     "use strict";
     var AbstractField = require('web.AbstractField');
     var relational_fields = require('web.relational_fields');
     var FieldMany2One = relational_fields.FieldMany2One;
     var core = require('web.core');
-    var qweb = core.qweb;
-    var field_utils = require('web.field_utils');
     var _t = core._t;
     var ChoiceItemsMany2one = FieldMany2One.extend({
         events: _.extend({}, FieldMany2One.prototype.events, {
             'blur input': '_onBlur',
             'keydown input': '_onKeydown',
-
         }),
         _onBlur: function (e) {},
-
         /**输入时按tab键,跳到下一个项目
          * @param  {} e
          */
@@ -282,7 +433,6 @@ odoo.define('accountcore.accountcoreVoucher', ['web.AbstractField', 'web.relatio
                     } else {
                         self._super.apply(self, arguments);
                     };
-                    // $('.itemChoice').nextUntil('.o_input').first().focus();
                     break;
                 default:
                     self._super.apply(self, arguments);
@@ -292,7 +442,6 @@ odoo.define('accountcore.accountcoreVoucher', ['web.AbstractField', 'web.relatio
             this.ac_itemTypeId = typeId;
             this.ac_itemName = itemName;
             this.ac_itemId = itemId;
-            // this.ac_valueItemId = itemId;
             this.ac_newItemName = itemName;
             this.ac_newItemId = itemId;
             this.ac_lastSetValueItemId = undefined;
@@ -302,19 +451,23 @@ odoo.define('accountcore.accountcoreVoucher', ['web.AbstractField', 'web.relatio
             } else {
                 this.m2o_value = "";
             };
-
         },
         start: function () {
             this._super.apply(this, arguments);
-
         },
         _formatValue: function (value) {
-
             if (this.ac_itemName) {
                 return this.ac_itemName;
             };
             return "";
-
+        },
+        //该方法覆写父类的FieldMany2One的对应方法 ,为了在凭证中直接新增项目,传递项目类别给上下文
+        _createContext: function (name) {
+            var tmp = this._super.apply(this, arguments);
+            if (tmp) {
+                tmp["default_itemClass"] = this.ac_itemTypeId;
+            }
+            return tmp;
         },
         _search: function (search_val) {
             var self = this;
@@ -323,12 +476,8 @@ odoo.define('accountcore.accountcoreVoucher', ['web.AbstractField', 'web.relatio
             var context = this.record.getContext(this.recordParams);
             var domain = this.record.getDomain(this.recordParams);
             _.extend(context, this.additionalContext);
-
             var blacklisted_ids = this._getSearchBlacklist();
-            if (blacklisted_ids.length > 0) {
-                // domain.push(['id', 'not in', blacklisted_ids]);
-
-            }
+            if (blacklisted_ids.length > 0) {}
             //使核算项目下拉列表只选择对应类别
             domain.push(['itemClass', '=', this.ac_itemTypeId]);
             this._rpc({
@@ -352,7 +501,6 @@ odoo.define('accountcore.accountcoreVoucher', ['web.AbstractField', 'web.relatio
                             id: x[0],
                         };
                     });
-
                     // search more... if more results than limit
                     if (values.length > self.limit) {
                         values = values.slice(0, self.limit);
@@ -406,13 +554,10 @@ odoo.define('accountcore.accountcoreVoucher', ['web.AbstractField', 'web.relatio
                             label: _t("No results to show..."),
                         });
                     }
-
                     def.resolve(values);
                 });
-
             return def;
         },
-
         _onFieldChanged: function (event) {
             this.lastChangeEvent = event; //test
             var newItem = event.data.changes.items;
@@ -420,20 +565,13 @@ odoo.define('accountcore.accountcoreVoucher', ['web.AbstractField', 'web.relatio
             this.ac_newItemId = newItem.id;
             this.$input.val(this.ac_newItemName);
         },
-
     });
     var choiceItemsModel = AbstractField.extend({
         //凭证中的选择核算项目
         supportedFieldTypes: ['many2many'],
         template: 'accountcore_voucher_choice_items',
-
-        custom_events: _.extend({}, AbstractField.prototype.custom_events, {
-
-        }),
-        events: _.extend({}, AbstractField.prototype.events, {
-
-        }),
-
+        custom_events: _.extend({}, AbstractField.prototype.custom_events, {}),
+        events: _.extend({}, AbstractField.prototype.events, {}),
         init: function (parent, name, record, options, accountId) {
             this._super.apply(this, arguments);
             this.limit = 8;
@@ -449,17 +587,10 @@ odoo.define('accountcore.accountcoreVoucher', ['web.AbstractField', 'web.relatio
                     $focusable.focus();
                     this.ac_focus_n += 1;
                 };
-                // if ($focusable.is('input[type="text"], textarea')) {
-                //     $focusable[0].selectionStart = $focusable[0].selectionEnd = $focusable[0].value.length;
-                //     if (options && !options.noselect) {
-                //         $focusable.select();
-                //     }
-                // }
                 return true;
             }
             return false;
         },
-
         /**
          * 加载和设置分录核算项目
          * @returns {Deferred}
@@ -474,9 +605,7 @@ odoo.define('accountcore.accountcoreVoucher', ['web.AbstractField', 'web.relatio
             var self = this;
             self.itemChoiceContainer = this.$el;
             return this._super.apply(this, arguments);
-
         },
-
         reinitialize: function (value) {
             this.isDirty = false;
             this.floating = false;
@@ -506,14 +635,12 @@ odoo.define('accountcore.accountcoreVoucher', ['web.AbstractField', 'web.relatio
             var typeId = 'itemType_' + itemType.id;
             var attrs = this.attrs;
             var item = self._getItem(self.ac_items, itemType.id);
-
             var oneItemChoice = new ChoiceItemsMany2one(self, self.name, self.record, {
                 mode: 'edit',
                 noOpen: true,
                 viewType: self.viewType,
                 attrs: attrs,
             }, itemType.id, item.name, item.id);
-
             var itemsIds = $.map(self.ac_items, function (i) {
                 return i.id;
             });
@@ -525,7 +652,10 @@ odoo.define('accountcore.accountcoreVoucher', ['web.AbstractField', 'web.relatio
             var seletiontag = itemRow.find('.ac-item-selection').first();
             oneItemChoice.appendTo(seletiontag);
             self.ac_choiceItemsMany2ones.push(oneItemChoice);
-            oneItemChoice.$el.find('input').attr('id', typeId);
+            while (!oneItemChoice.$el) {
+                oneItemChoice.$el.find('input').attr('id', typeId);
+                return;
+            }
         },
         /**获取科目下挂的核算项目类别
          * @param  {integer} accountId 科目ID
@@ -537,13 +667,12 @@ odoo.define('accountcore.accountcoreVoucher', ['web.AbstractField', 'web.relatio
                 method: 'get_itemClasses',
                 args: [accountId]
             });
-
         },
         /**构建核算项目类别标签
          * @param  {string} itemTypeName 核算项目类别名称
          */
         _createItemChoiceHtml: function (itemTypeName) {
-            var htmlstr = "<div class='row itemChoice'><div class='col-3 ac-item-type-name'>" + itemTypeName + "</div><div class='ac-item-selection'></div></div>";
+            var htmlstr = "<div class='row itemChoice' width='100%'><div class='col-4 ac-item-type-name'>" + itemTypeName + "</div><div class='ac-item-selection col-8'></div></div>";
             return htmlstr;
         },
         _removeTag: function (id) {
@@ -597,24 +726,103 @@ odoo.define('accountcore.accountcoreVoucher', ['web.AbstractField', 'web.relatio
     return {
         ChoiceItemsMany2one: ChoiceItemsMany2one,
         choiceItemsModel: choiceItemsModel,
-
     }
 });
-//给凭证列表视图添加按钮
-odoo.define('accountcore.accountcoreVoucheListButton', function (require) {
+//核算机构列表视图
+odoo.define('accountcore.orgListView', function (require) {
     "use strict";
     var ListView = require('web.ListView');
     var viewRegistry = require('web.view_registry');
     var ListController = require('web.ListController');
-    var voucherListController = ListController.extend({
+    var newListController = ListController.extend({
+
         renderButtons: function () {
+            this.ac_url_suffix=this.modelName;
+            this._super.apply(this, arguments);
+            if (this.$buttons) {
+
+            };
+        },
+
+
+    });
+    var newListView = ListView.extend({
+        config: _.extend({}, ListView.prototype.config, {
+            Controller: newListController,
+        }),
+    });
+    viewRegistry.add('orgListView', newListView);
+    return newListView;
+});
+//核算项目列表视图
+odoo.define('accountcore.itemListView', function (require) {
+    "use strict";
+    var ListView = require('web.ListView');
+    var viewRegistry = require('web.view_registry');
+    var ListController = require('web.ListController');
+    var newListController = ListController.extend({
+
+        renderButtons: function () {
+            this.ac_url_suffix=this.modelName;
+            this._super.apply(this, arguments);
+            if (this.$buttons) {
+
+            };
+        },
+
+
+    });
+    var newListView = ListView.extend({
+        config: _.extend({}, ListView.prototype.config, {
+            Controller: newListController,
+        }),
+    });
+    viewRegistry.add('itemListView', newListView);
+    return newListView;
+});
+//会计科目列表视图
+odoo.define('accountcore.accountListView', function (require) {
+    "use strict";
+    var ListView = require('web.ListView');
+    var viewRegistry = require('web.view_registry');
+    var ListController = require('web.ListController');
+    var newListController = ListController.extend({
+
+        renderButtons: function () {
+            this.ac_url_suffix=this.modelName;
+            this._super.apply(this, arguments);
+            if (this.$buttons) {
+
+            };
+        },
+
+
+    });
+    var newListView = ListView.extend({
+        config: _.extend({}, ListView.prototype.config, {
+            Controller: newListController,
+        }),
+    });
+    viewRegistry.add('accountListView', newListView);
+    return newListView;
+});
+//凭证列表视图
+odoo.define('accountcore.voucherListView', function (require) {
+    "use strict";
+    var ListView = require('web.ListView');
+    var viewRegistry = require('web.view_registry');
+    var ListController = require('web.ListController');
+    var VoucherSort = require('accountcore.voucher_sort_by_number');
+    var voucherListController = ListController.extend({
+
+        renderButtons: function () {
+            this.ac_url_suffix=this.modelName;
             this._super.apply(this, arguments);
             if (this.$buttons) {
                 var btns = this.$buttons;
-                var ac_voucher_number_sort_btn = btns.find('.ac_voucher_number_sort'); //凭证编号排序按钮
-                ac_voucher_number_sort_btn.on('click', this.proxy('vouchersSortByNumber'));
-                var ac_voucher_filter_btn = btns.find('.ac_voucher_filter'); //查询按钮
-                ac_voucher_filter_btn.on('click', this.proxy('voucher_filter'));
+                var voucherSort = new VoucherSort(this);
+                voucherSort.appendTo(btns);
+                voucherSort._click = this.proxy('vouchersSortByNumber');
             };
         },
         /**依据凭证编号对凭证列表进行排序
@@ -625,7 +833,6 @@ odoo.define('accountcore.accountcoreVoucheListButton', function (require) {
             trs.detach();
             trs.sort(this._voucherNumbersort);
             tbody.append(trs);
-
         },
         _voucherNumbersort: function (a, b) {
             return $(a).find('.voucherNumber').text() - $(b).find('.voucherNumber').text();
@@ -634,6 +841,7 @@ odoo.define('accountcore.accountcoreVoucheListButton', function (require) {
         voucher_filter: function () {
             alert('暂未实现');
         },
+
     });
     var voucherListView = ListView.extend({
         config: _.extend({}, ListView.prototype.config, {
@@ -642,6 +850,45 @@ odoo.define('accountcore.accountcoreVoucheListButton', function (require) {
     });
     viewRegistry.add('voucherListView', voucherListView);
     return voucherListView;
+});
+//凭证列表策略号排序小部件(按钮)
+odoo.define("accountcore.voucher_sort_by_number", function (require) {
+    "use strict";
+    var Widget = require('web.Widget');
+    var VoucherSort = Widget.extend({
+        template: 'accountcore.voucher_sort_by_number',
+        events: {
+            'click': '_click',
+        },
+        _click: function () {},
+    });
+    return VoucherSort;
+});
+//分录列表视图
+odoo.define('accountcore.entryListView', function (require) {
+    "use strict";
+    var ListView = require('web.ListView');
+    var viewRegistry = require('web.view_registry');
+    var ListController = require('web.ListController');
+    var newListController = ListController.extend({
+
+        renderButtons: function () {
+            this.ac_url_suffix=this.modelName;
+            this._super.apply(this, arguments);
+            if (this.$buttons) {
+
+            };
+        },
+
+
+    });
+    var newListView = ListView.extend({
+        config: _.extend({}, ListView.prototype.config, {
+            Controller: newListController,
+        }),
+    });
+    viewRegistry.add('entryListView', newListView);
+    return newListView;
 });
 //启用期初列表视图
 odoo.define('accountcore.balanceListView', function (require) {
@@ -659,7 +906,6 @@ odoo.define('accountcore.balanceListView', function (require) {
                 check_balance_btn.appendTo(btns);
             };
         },
-
     });
     var balanceListView = ListView.extend({
         config: _.extend({}, ListView.prototype.config, {
@@ -669,7 +915,7 @@ odoo.define('accountcore.balanceListView', function (require) {
     viewRegistry.add('balanceListView', balanceListView);
     return balanceListView;
 });
-//启用期初平衡检查按钮
+//启用期初平衡检查小部件(按钮)
 odoo.define("accountcore.begin_balance_check", function (require) {
     "use strict";
     var Widget = require('web.Widget');
@@ -690,29 +936,7 @@ odoo.define("accountcore.begin_balance_check", function (require) {
                 ],
                 target: 'new'
             });
-            // framework.blockUI();
-            // alert('开始试算平衡');
-            // this._rpc({
-            //     model: 'accountcore.account',
-            //     method: 'get_itemClasses',
-            //     args: [176],
-            // }).then(function (items) {
-            //     // _.map(items,function(){
-            //     //     s=s+self.name;
-            //     //   });
-
-            //     console.log('over!');
-            //     setTimeout(function () {
-            //         framework.unblockUI();
-            //         self.do_notify('结果', '该功能还在开发中!');
-            //     }, 5000);
-
-            // }, function () {
-            //     console.log('error!');
-            //     FrameWork.unbolckUI();
-            // });
         },
-
     });
     return CheckBalance;
 });
@@ -724,7 +948,7 @@ odoo.define("accountcore.fast_period", ['web.AbstractField', 'web.field_registry
     var Perod_tool = require('accountcore.period_tool');
     var ac_fast_period = AbstractField.extend({
         supportedFieldTypes: ['date'],
-        template: 'accountcore.fast_period',
+        template: 'accountcore_fast_period',
         attributes: {
             style: "background-color:white;border: 1px solid grey;"
         },
@@ -764,7 +988,6 @@ odoo.define("accountcore.fast_period", ['web.AbstractField', 'web.field_registry
                     return voucherPeriod.getSecondHalfPreYear()
                 default:
                     return voucherPeriod.getCurrentMonth();
-
             };
         },
     });
@@ -773,7 +996,6 @@ odoo.define("accountcore.fast_period", ['web.AbstractField', 'web.field_registry
     return {
         ac_fast_period: ac_fast_period,
     };
-
 });
 //期间处理工具
 odoo.define('accountcore.period_tool', function (require) {
@@ -818,7 +1040,6 @@ odoo.define('accountcore.period_tool', function (require) {
             var days = this.getDaysOf(year, 12);
             var endDate = new Date(year, 11, days);
             return new PeriodScop(firstDate, endDate);
-
         },
         getPreYear: function () {
             var year = this.year - 1
@@ -836,7 +1057,7 @@ odoo.define('accountcore.period_tool', function (require) {
             if (1 <= month && month <= 3) {
                 firstMonth = 1;
                 endMonth = 3;
-            } else if (4 <= month && month < 6) {
+            } else if (4 <= month && month <= 6) {
                 firstMonth = 4;
                 endMonth = 6;
             } else if (7 <= month && month <= 9) {
@@ -847,7 +1068,6 @@ odoo.define('accountcore.period_tool', function (require) {
             var firstDate = new Date(year, firstMonth - 1, 1);
             var endDate = new Date(year, endMonth - 1, days);
             return new PeriodScop(firstDate, endDate);
-
         },
         getPreSeason: function () {
             var month = this.month;
@@ -856,13 +1076,16 @@ odoo.define('accountcore.period_tool', function (require) {
             var endMonth = 12;
             if (1 <= month && month <= 3) {
                 year = this.year - 1
-            } else if (4 <= month && month < 6) {
+            } else if (4 <= month && month <= 6) {
+                firstMonth = 1;
+                endMonth = 3;
+            } else if (7 <= month && month <= 9) {
                 firstMonth = 4;
                 endMonth = 6;
-            } else if (7 <= month && month <= 9) {
+            }else if (10<= month && month <=12){
                 firstMonth = 7;
                 endMonth = 9;
-            };
+            }
             var days = this.getDaysOf(year, endMonth)
             var firstDate = new Date(year, firstMonth - 1, 1);
             var endDate = new Date(year, endMonth - 1, days);
@@ -907,22 +1130,17 @@ odoo.define('accountcore.period_tool', function (require) {
             this.startMonth = startDate.getMonth() + 1;
             this.endYear = endDate.getFullYear();
             this.endMonth = endDate.getMonth();
-
         },
-        getPeriodList: function () {
-
-        }
-
+        getPeriodList: function () {}
     });
-
     return {
         'VoucherPeriod': VoucherPeriod,
         'PeriodScop': PeriodScop,
         'Period': Period,
     };
 });
-// 自定义按钮
-odoo.define('accountcore.btn', ['web.AbstractField', 'web.field_registry'], function (require) {
+// 触发服务端方法字段小部件(按钮)
+odoo.define('accountcore.field_btn', ['web.AbstractField', 'web.field_registry'], function (require) {
     "use strict";
     var AbstractField = require('web.AbstractField');
     // 点击按钮触发后台@api.onchage('本字段')装饰的方法
@@ -932,7 +1150,6 @@ odoo.define('accountcore.btn', ['web.AbstractField', 'web.field_registry'], func
     var ac_btn_trigger_onchange = AbstractField.extend({
         events: _.extend({
             'click': '_btn_click',
-
         }, AbstractField.prototype.events, {}),
         supportedFieldTypes: ['char'],
         template: 'accountcor.ac_btn',
@@ -942,7 +1159,6 @@ odoo.define('accountcore.btn', ['web.AbstractField', 'web.field_registry'], func
             this._super.apply(this, arguments);
         },
         _btn_click: function () {
-
             this._setValue('1', opetions);
         },
     });
@@ -996,7 +1212,6 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
     var ac_jexcel = AbstractField.extend({
         events: _.extend({
             '.jexcel td click': '_do_check',
-
         }, AbstractField.prototype.events, {}),
         supportedFieldTypes: ['text'],
         template: 'ac_jexcel',
@@ -1045,6 +1260,15 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
             return this._changeDateStr(endDate);
         },
         /**
+         * 获得机构名称
+         */
+        _getOrgs: function () {
+            var orgs = _.map($(".ac_choice_orgs").find('input:checked'), function (input) {
+                return $(input).parent().find("label").text();
+            });
+            return orgs.join('+');
+        },
+        /**
          * 获得供报表公式计算的机构范围参数
          */
         _getOrgIds: function () {
@@ -1072,7 +1296,6 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
             if (str.slice(0, 1) == '=') {
                 return true;
             }
-
         },
         // 触发更新表格单元格数据，样式和批注
         _changeStyleAndData: function (instance) {
@@ -1091,10 +1314,7 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
         _getComments: function (instance) {
             return self._getAllCellsInfo(instance.jexcel, 'getComments')
         },
-        _getFomulas: function (jexcel) {
-
-        },
-
+        _getFomulas: function (jexcel) {},
         /**
          * @description 获得表格各列宽
          * @param  {} instance
@@ -1194,7 +1414,7 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
             for (var j = 0; j < y; j++) {
                 for (var i = 0; i < x; i++) {
                     v = self.jexcel_obj.getValueFromCoords(j, i);
-                    if (v && v.slice(0, 1) == '=') {
+                    if (v && (v.toString()).slice(0, 1) == '=') {
                         cellName = jexcel.getColumnNameFromId([j, i]);
                         // 计算缓存标记
                         self.jexcel_obj.setMeta(cellName, 'isComputed', 'n');
@@ -1205,7 +1425,6 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                             self.jexcel_obj.setMeta(cellName, 'isComputed', 'n');
                         }
                     }
-
                 }
             }
             // 计算完毕,关闭遮罩
@@ -1213,7 +1432,6 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
         },
         _changeDateStr: function (dateStr) {
             return dateStr.replace('年', '-').replace('月', '-').replace('日', '')
-
         },
         _renderEdit: function () {
             self = this;
@@ -1223,16 +1441,17 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
             };
             this.ddom = document.createElement('div');
             this.$el.append(this.ddom);
-
-            // var d = self.value;
             var options = {
                 editable: (this.mode === 'edit'),
-                tableOverflow: false,
+                tableOverflow:true,
                 tableHeight: "297mm",
+                tableWidth: "260mm",
+                fullscreen: false,
+                freezeColumns:2,
                 fullscreen: false,
                 defaultColWidth: 150,
                 wordWrap: true,
-                minDimensions: [4, 5],
+                minDimensions: [3, 5],
                 rowResize: true,
                 columnResize: true,
                 allowComments: (this.mode === 'edit'),
@@ -1248,6 +1467,7 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                 allowRenameColumn: false,
                 // 排序和odoo可能有冲突，所以禁用
                 columnSorting: false,
+                csvFileName: "报表",
                 data: $.parseJSON(self.value),
                 mergeCells: $.parseJSON(self.record.data['merge_info']),
                 // 自定义扩展option
@@ -1266,7 +1486,6 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                                 self.do_notify('提示', '在编辑状态下才能操作！');
                                 return;
                             }
-
                         }
                     },
                     {
@@ -1279,7 +1498,6 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                                 self.do_notify('提示', '在编辑状态下才能操作！');
                                 return;
                             }
-
                         }
                     },
                     {
@@ -1345,10 +1563,9 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                                 return;
                             }
                             // var cell = jexcel.getColumnNameFromId([self.selection_x1, self.selection_y1])
-                            var x = self.selection_x2 - self.selection_x1;
-                            var y = self.selection_y2 - self.selection_y1;
-                            self.jexcel_obj.setMerge("", x, y);
-
+                            // var x = self.selection_x2 - self.selection_x1;
+                            // var y = self.selection_y2 - self.selection_y1;
+                            self.jexcel_obj.setMerge();
                         },
                     },
                     // 取消合并单元格
@@ -1363,7 +1580,6 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                             }
                             var cell = jexcel.getColumnNameFromId([self.selection_x1, self.selection_y1]);
                             self.jexcel_obj.removeMerge(cell);
-
                         }
                     },
                     // 公式向导
@@ -1385,16 +1601,36 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                         content: 'move_to_inbox',
                         tooltip: '下载报表(保留公式)',
                         onclick: function () {
+                            var startDate = self._getStartDate();
+                            var endDate = self._getEndDate();
+                            var orgs = self._getOrgs();
+                            var fileName = self.record.data['name'] + "[" + startDate + "至" + endDate + "]" + orgs;
+                            if (fileName.length>60){
+                                fileName=fileName.slice(0,60)+"等等";
+                            }
+                            self.jexcel_obj.options.csvFileName=fileName;
+                            console.info(self.jexcel_obj.options.csvFileName);
                             self.jexcel_obj.ACDownloadFomular();
                         }
                     },
-                    // 下载表格为csv,数据，不带公式
+                    // 下载表格为excel,数据，不带公式
                     {
                         type: 'i',
                         content: 'save_alt',
                         tooltip: '下载报表(数据)',
                         onclick: function () {
-                            self.jexcel_obj.ACDownloadOnlyDate();
+                            var startDate = self._getStartDate();
+                            var endDate = self._getEndDate();
+                            var orgs = self._getOrgs();
+                            var fileName = self.record.data['name'] + "[" + startDate + "至" + endDate + "]" + orgs + ".xls";
+                            if (fileName.length>60){
+                                fileName=fileName.slice(0,60)+"等等";
+                            }
+                            $("#print_content tbody").table2excel({
+                                exclude: "tr td:first-child",
+                                filename: fileName,
+                                preserveColors: true
+                            });
                         }
                     },
                     // 归档
@@ -1425,7 +1661,11 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                         content: 'airplay',
                         onclick: function () {
                             self.jexcel_obj.fullscreen();
-
+                            if($("div.jexcel_container").hasClass("fullscreen")){
+                                $(".jexcel_content").width(window.innerWidth);                   
+                            }else{
+                                $(".jexcel_content").css({"width":"260mm"});
+                            }   
                         }
                     },
                     // 移动工具栏
@@ -1435,7 +1675,6 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                         content: 'swap_vertical',
                         onclick: function () {
                             self.$el.find('.jexcel_toolbar').toggleClass('jexecl_toolbar_place');
-
                         }
                     },
                     // 打印
@@ -1444,16 +1683,19 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                         tooltip: '打印',
                         content: 'print',
                         onclick: function () {
+                            var startDate = self._getStartDate();
+                            var endDate = self._getEndDate();
+                            var orgs = self._getOrgs();
+                            var fileName = self.record.data['name'] + "[" + startDate + "至" + endDate + "]" + orgs;
                             printJS({
                                 printable: 'print_content',
                                 type: 'html',
-                                css: ['/accountcore/static/css/jsuites.css','/accountcore/static/css/jexcel.css'],
+                                css: ['/accountcore/static/css/jexcel.css', '/accountcore/static/css/jsuites.css'],
                                 scanStyles: false,
-                                ignoreElements:[],
-                                style:".jexcel_row{visibility: hidden !important;}.jexcel_toolbar{display: none !important;}table>thead{visibility: hidden !important;}",
+                                ignoreElements: [],
+                                style: ".jexcel_toolbar{display: none !important;}table>thead{display: none !important;visibility: hidden !important;}",
+                                documentTitle: fileName
                             })
-
-
                         }
                     },
                     // 计算
@@ -1484,7 +1726,6 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                             }
                         }
                     },
-
                 ],
                 // 
                 text: {
@@ -1493,6 +1734,7 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                     show: '显示',
                     entries: '明细',
                     openAccountFormula: '设置科目取数公式',
+                    openCashFlowFormula: '设置现金流量取数公式',
                     insertANewColumnBefore: '在前面插入一列',
                     insertANewColumnAfter: '在后面插入一列',
                     deleteSelectedColumns: '删除选中列',
@@ -1508,17 +1750,16 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                     clearComments: '清除批注',
                     copy: '复制',
                     paste: '粘贴',
-                    saveAs: '下载保存',
+                    saveAs: '下载保存公式',
                     // about: ​ '关于', 修改后将无法使用
                     areYouSureToDeleteTheSelectedRows: '你确定要删除选中行?',
                     areYouSureToDeleteTheSelectedColumns: '你确定要删除选中列?',
-                    thisActionWillDestroyAnyExistingMergedCellsAreYouSure: '你是否确定要取消合并单元格?',
+                    thisActionWillDestroyAnyExistingMergedCellsAreYouSure: '需要取消合并单元格?',
                     thisActionWillClearYourSearchResultsAreYouSure: '该操作会清除你的搜索结果，你是否确定?',
                     thereIsAConflictWithAnotherMergedCell: '与另一个合并的单元格有冲突!',
                     invalidMergeProperties: '无效的合并',
                     cellAlreadyMerged: '单元格已经被合并,可以取消合并',
                     noCellsSelected: '没有选中任何单元格',
-
                 },
                 onload: function (instance) {
                     // 初始化表格单元格值
@@ -1567,109 +1808,82 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                 },
                 onchange: function (instance, cell, x, y, value) {
                     self._setValue(JSON.stringify(instance.jexcel.getData()));
-                    // var cellName = jexcel.getColumnNameFromId([x, y]);
-                    // var data = instance.jexcel.getData()[y][x];
-                    // if (self._isACFormula(data)) {
-                    //     try {
-                    //         var cellformula = new ACFormula(data);
-                    //         instance.jexcel.setMeta(cellName, cellformula.name(), cellformula.value());
-                    //     } catch (error) {
-                    //         self.do_warn(error);
-                    //     }
-                    // } else {
-                    // var meta=instance.jexcel.getMeta(cellName);
-                    // for(var k in meta){
-                    //     instance.jexcel.setMeta(cellName,k,null);
-                    // }
-                    // if (instance.jexcel.options.meta && instance.jexcel.options.meta[cellName]) {
-                    //     delete instance.jexcel.options.meta[cellName];
-                    // }
-                    // }
                 },
-                oninsertrow: function (instance) {
-
+                oninsertrow: function (instance) {},
+                onbeforedeleterow: function (instance, rowNumber, numOfRows) {
+                    // removeMerge
+                    // var x = rowNumber + numOfRows;
+                    // var y = self.jexcel_obj.colgroup.length;
+                    // var cellname = '';
+                    // for (var j = 0; j < y; j++) {
+                    //     for (var i = rowNumber; i < x; i++) {
+                    //         cellname = jexcel.getColumnNameFromId([j, i]);
+                    //         instance.jexcel.removeMerge(cellname);
+                    //     }
+                    // }
+                    // return true
                 },
                 ondeleterow: function (instance) {
-
                     self._changeStyleAndData(instance);
                 },
                 oninsertcolumn: function (instance) {
-
-                },
-                ondeletecolumn: function (instance) {
-
                     self._changeStyleAndData(instance);
                 },
-                onmoverow: function (instance) {
-
+                ondeletecolumn: function (instance) {
+                    self._changeStyleAndData(instance);
                 },
-                onmovecolumn: function (instance, from, to) {
-
-                },
+                onmoverow: function (instance) {},
+                onmovecolumn: function (instance, from, to) {},
                 onmerge: function (instance) {
-
+                    self._changeStyleAndData(instance);
                 },
-                onresizerow: function (instance) {
-
-                },
-                onresizecolumn: function (instance) {
-
-                },
+                onresizerow: function (instance) {},
+                onresizecolumn: function (instance) {},
                 onsort: function (instance, cellNum, order) {
                     if (self.mode != 'edit') {
                         return;
                     }
-
-
                 },
                 onresizerow: function (instance, cell, height) {
                     if (self.mode != 'edit') {
                         return;
                     }
-
                 },
                 onresizecolumn: function (instance, cell, width) {
                     if (self.mode != 'edit') {
                         return;
                     }
-
                 },
                 onchangeheader: function (instantce, column, old_name, new_name) {
                     if (this.mode != 'edit') {
                         return;
                     }
                 },
-                onmerge: function () {
-
-                },
-
                 onblur: function (instance) {
                     self._changeStyleAndData(instance);
-
                 },
-                onfocus() {
-
-                },
+                onfocus() {},
                 onselection: function (instance, x1, y1, x2, y2, origin) {
                     self._setSelectionCells(x1, y1, x2, y2);
                 },
-                updateTable: function (instance, cell, col, row, val, label, cellName) {
-
-                },
-
+                updateTable: function (instance, cell, col, row, val, label, cellName) {},
             };
             self.jexcel_obj = jexcel(this.ddom, options);
             // 添加ID以便打印调用
-            this.$el.find('.jexcel').attr("id","print_content");
+            this.$el.find('.jexcel').attr("id", "print_content");
             // 设置右键科目取数公式菜单在编辑状态下可见
             self.jexcel_obj.options.allowOpenAccountFormula = (this.mode === 'edit');
+            self.jexcel_obj.options.allowopenCashFlowFormula = (this.mode === 'edit');
             // 设置默认行高             
             self.jexcel_obj.options.defaultRowsHeight = 25;
             // 注册打开设置公式向导方法                                                                     
             self.jexcel_obj.openAccountFormula = function () {
                 self._openAccountFormulaWizard();
             };
-
+            // 注册打开设置现金流量公式向导方法                                                                     
+            self.jexcel_obj.openCashFlowFormula = function () {
+                self._openCashFlowFormulaWizard();
+            };
         },
         _renderReadonly: function () {
             this._renderEdit(arguments);
@@ -1682,7 +1896,9 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                 if (pre == '=') {
                     // if 单元格定义了ac公式
                     var context = {
-                        ac: formula.slice(1)
+                        ac: formula.slice(1),
+                        // 不通过后台重写的查找函数控制机构范围
+                        control_org:true
                     }
                     this.do_action({
                         name: '报表科目取数公式设置向导',
@@ -1701,13 +1917,45 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
                 name: '报表科目取数公式设置向导',
                 type: 'ir.actions.act_window',
                 res_model: 'accountcore.reportmodel_formula',
+                context:{control_org:false},
                 views: [
                     [false, 'form']
                 ],
                 target: 'new'
             });
-
-
+        },
+        // 打开报表现金流量设置向导窗体
+        _openCashFlowFormulaWizard: function () {
+            var formula = self.jexcel_obj.getValueFromCoords(self.selection_x1, self.selection_y1) || '';
+            if (formula) {
+                var pre = formula.slice(0, 1);
+                if (pre == '=') {
+                    // if 单元格定义了ac公式
+                    var context = {
+                        ac: formula.slice(1)
+                    }
+                    this.do_action({
+                        name: '报表现金流量取数公式设置向导',
+                        type: 'ir.actions.act_window',
+                        res_model: 'accountcore.report_cashflow_formula',
+                        context: context,
+                        views: [
+                            [false, 'form']
+                        ],
+                        target: 'new'
+                    });
+                    return;
+                }
+            }
+            this.do_action({
+                name: '报表现金流量取数公式设置向导',
+                type: 'ir.actions.act_window',
+                res_model: 'accountcore.report_cashflow_formula',
+                views: [
+                    [false, 'form']
+                ],
+                target: 'new'
+            });
         },
     });
     // 表格设计器表格的样式字段小部件
@@ -1811,7 +2059,7 @@ odoo.define('accountcore.myjexcel', ['web.AbstractField', 'web.field_registry', 
             this._super.apply(this, arguments);
         },
         start: function () {
-            core.bus.trigger('ac_jexcel_set_formula', this.context.accountName);
+            core.bus.trigger('ac_jexcel_set_formula', this.context.ac_formula);
         },
         on_attach_callback: function () {
             // 取消遮挡的小部件

@@ -4,31 +4,34 @@ import datetime
 from decimal import Decimal
 import json
 import logging
-import multiprocessing
+import threading
 from ..models.ac_obj import ACTools
 from odoo import models, fields, api, SUPERUSER_ID, exceptions
 from odoo import tools
+from odoo import sql_db
 import sys
 sys.path.append('.\\.\\server\\odoo')
 sys.path.append('.\\.\\')
-
 # 日志
 LOGGER = logging.getLogger(__name__)
 # 新增,修改,删除凭证时对科目余额的改变加锁
-VOCHER_LOCK = multiprocessing.Lock()
-
-
+VOCHER_LOCK = threading.RLock()
 # 全局标签模型,用于多重继承方式添加到模型
+# 金额的默认币别,人民币在系统中的id
+CNY = 7
+
+
 class Glob_tag_Model(models.AbstractModel):
     '''全局标签模型,用于多重继承方式添加到模型'''
     _name = "accountcore.glob_tag_model"
     _description = '全局标签模型'
+    is_current = fields.Boolean(string="当前机构", compute="_is_current")
     glob_tag = fields.Many2many('accountcore.glob_tag',
                                 string='全局标签',
                                 index=True)
-
-
 # 全局标签类别
+
+
 class GlobTagClass(models.Model):
     '''全局标签类别'''
     _name = 'accountcore.glob_tag_class'
@@ -40,9 +43,9 @@ class GlobTagClass(models.Model):
                          '全局标签类别编码重复了!'),
                         ('accountcore_itemclass_name_unique', 'unique(name)',
                          '全局标签类别名称重复了!')]
-
-
 # 模块全局标签
+
+
 class GlobTag(models.Model):
     '''模块全局标签'''
     _name = 'accountcore.glob_tag'
@@ -52,7 +55,7 @@ class GlobTag(models.Model):
                                      string='全局标签类别',
                                      index=True,
                                      ondelete='restrict')
-    summary = fields.Char(string='使用范围和简介', required=True)
+    summary = fields.Char(string='使用范围和简介')
     js_code = fields.Text(string='js代码')
     python_code = fields.Text(string='python代码')
     sql_code = fields.Text(string='sql代码')
@@ -60,27 +63,80 @@ class GlobTag(models.Model):
     application = fields.Html(string='详细使用说明')
     _sql_constraints = [('accountcore_glob_tag_name_unique', 'unique(name)',
                          '模块全局标签重复了!')]
-
-
 # model-开始
 # 会计核算机构
+
+
 class Org(models.Model, Glob_tag_Model):
     '''会计核算机构'''
     _name = 'accountcore.org'
     _description = '会计核算机构'
-    number = fields.Char(string='核算机构编码', required=True)
+    number = fields.Char(string='核算机构编码')
     name = fields.Char(string='核算机构名称', required=True)
     accounts = fields.One2many('accountcore.account',
                                'org',
                                string='科目')
-
+    user_ids = fields.Many2many('res.users', string='有权用户')
+    start_date = fields.Date(string="启用日期", compute="_get_start_date", help="该机构的科目最早启用日期")
+    lock_date = fields.Date(string="锁定日期", help="只能修改该日期后的凭证")
+    last_voucher_date = fields.Date(
+        string="最后凭证日", compute="_get_last_voucher_date")
     _sql_constraints = [('accountcore_org_number_unique', 'unique(number)',
                          '核算机构编码重复了!'),
                         ('accountcore_org_name_unique', 'unique(name)',
                          '核算机构名称重复了!')]
 
+    def _is_current(self):
+        '''是否当前机构'''
+        current_id = self.env.user.currentOrg.id
+        for e in self:
+            if current_id == e.id:
+                e.is_current = True
+            else:
+                e.is_current = False
 
+    def toggle(self):
+        return {
+            'name': '设置机构默认值',
+            'type': 'ir.actions.act_window',
+            'res_model': 'accountcoure.userdefaults',
+            'view_mode': 'form',
+            'target': 'new',
+        }
+
+    @api.multi
+    def unlink(self):
+        '''删除'''
+        for mySelf in self:
+            if mySelf.id == 1:
+                raise exceptions.ValidationError("不能删除默认机构，可以修改")
+        rl_bool = super(Org, self).unlink()
+        return rl_bool
+    
+    @api.multi
+    def _get_start_date(self):
+        '''获得机构的启用期'''
+        for org in self:
+            banlances = self.env['accountcore.accounts_balance'].search(
+                [('org', '=', org.id)], order='createDate', limit=2)
+            if banlances.exists():
+                org.start_date = banlances[0].createDate
+            else:
+                org.start_date = None
+
+    @api.multi
+    def _get_last_voucher_date(self):
+        '''机构最后的凭证日'''
+        for org in self:
+            last_voucher = self.env['accountcore.voucher'].search(
+                [('org', '=', org.id)], order='voucherdate desc', limit=1)
+            if last_voucher:
+                org.last_voucher_date = last_voucher.voucherdate
+            else:
+                org.last_voucher_date = None
 # 会计科目体系
+
+
 class AccountsArch(models.Model, Glob_tag_Model):
     '''会计科目体系'''
     _name = 'accountcore.accounts_arch'
@@ -90,28 +146,27 @@ class AccountsArch(models.Model, Glob_tag_Model):
                        help='对科目的一个分类,例如通用科目,某行业科目等')
     accounts = fields.One2many(
         'accountcore.account', 'accountsArch', string='科目')
-
     _sql_constraints = [('accountcore_accoutsarch_number_unique', 'unique(number)',
                          '科目体系编码重复了!'),
                         ('accountcore_accountsarch_name_unique', 'unique(name)',
                          '科目体系名称重复了!')]
-
-
 # 核算项目类别
+
+
 class ItemClass(models.Model, Glob_tag_Model):
     '''核算项目类别'''
     _name = 'accountcore.itemclass'
     _description = '核算项目类别'
-    number = fields.Char(string='核算项目类别编码', required=True)
+    number = fields.Char(string='核算项目类别编码')
     name = fields.Char(string='核算项目类别名称', required=True,
                        help='对核算项目的一个分类,不能重复,例如:员工,部门等')
     _sql_constraints = [('accountcore_itemclass_number_unique', 'unique(number)',
                          '核算项目类别编码重复了!'),
                         ('accountcore_itemclass_name_unique', 'unique(name)',
                          '核算项目类别名称重复了!')]
-
-
 # 核算项目
+
+
 class Item(models.Model, Glob_tag_Model):
     '''核算项目'''
     _name = 'accountcore.item'
@@ -132,7 +187,7 @@ class Item(models.Model, Glob_tag_Model):
                                 required=True,
                                 ondelete='restrict')
     item_class_name = fields.Char(related='itemClass.name',
-                                  string='核算项目类别',
+                                  string='项目类别',
                                   index=True,
                                   store=True,
                                   ondelete='restrict')
@@ -141,16 +196,6 @@ class Item(models.Model, Glob_tag_Model):
                         ('accountcore_item_name_unique', 'unique(name)',
                          '核算项目名称重复了!')]
 
-    # @api.model
-    # def name_search(self, name='', args=None, operator='ilike', limit=20):
-    #     # 更据context中account的值来对item的搜索进行过滤,仅查找account下挂的item类别中的item
-    #     if 'account' in self.env.context:
-    #         accountId = self.env.context['account']
-    #         account = self.env['accountcore.account'].sudo().browse(accountId)
-    #         filter_itemClass = [
-    #             itemclass.id for itemclass in account.itemClasses]
-    #         args.append(('itemClass', 'in', filter_itemClass))
-    #     return super(Item, self).name_search(name, args, operator, limit)
     @api.model
     def name_search(self, name='', args=None, operator='ilike', limit=20):
         # 更据context中account的值来对item的搜索进行过滤,仅查找account下挂的item类别中的item
@@ -166,14 +211,21 @@ class Item(models.Model, Glob_tag_Model):
             args.append(('itemClass', 'in', filter_itemClass))
         context = self.env.context
         org_id = context.get('org_id')
+        control_org = context.get('control_org')
+        control_org = control_org if control_org else True
+
         if org_id:
             # 修改凭证时从上下文取
             org = org_id
         else:
             # 新增时从用户默认值取，凭证机构的change会触发默认值从新设置
             org = self.env.user.currentOrg.id
-        domain = domain+['|', ('org', '=', False), ('org', 'in', [org])]
-        pos = self.search(domain+args, limit=limit, order='number')
+        if control_org:
+            domain = ['|', ('org', '=', False),
+                      ('org', 'in', [org])]+args+domain
+        elif args:
+            domain = ['|', ('org', '=', False)]+args+domain
+        pos = self.search(domain, limit=limit, order='number')
         # return pos.name_get()
         return pos._my_name_get()
 
@@ -233,31 +285,25 @@ class Item(models.Model, Glob_tag_Model):
         values['uniqueNumber'] = self.env['ir.sequence'].next_by_code(
             'item.uniqueNumber')
         rl = super(Item, self).create(values)
+        self.env.user.current_itemclass = rl.itemClass.id
         return rl
 
-    # @api.model
-    # def name_search(self, name='', args=None, operator='ilike', limit=0):
-    #     args = args or []
-    #     domain = []
-    #     # 同时根据科目编号和名称进行搜索
-    #     if name:
-    #         domain = ['|', ('number', operator, name),
-    #                   ('name', operator, name)]
-    #     # 源代码默认为160,突破其限制   详细见 /web/static/src/js/views/form_common.js
-    #     if limit == 160:
-    #         limit = 0
-    #     pos = self.search(domain+args, limit=limit, order='number')
-    #     # return pos.name_get()
-    #     return pos._my_name_get()
-
-
+    @api.model
+    def default_get(self, field_names):
+        default = super().default_get(field_names)
+        # 如果上下文有此标记为TRUE,就用res.user中设置的项目类别
+        if not self.env.context.get('itemclass_no_from_userInfo'):
+            default['itemClass'] = self.env.user.current_itemclass.id
+        return default
 # 凭证标签
+
+
 class RuleBook(models.Model, Glob_tag_Model):
     '''特殊的会计科目'''
     '''凭证标签'''
     _name = 'accountcore.rulebook'
     _description = '凭证标签'
-    number = fields.Char(string='凭证标签编码', required=True)
+    number = fields.Char(string='凭证标签编码')
     name = fields.Char(string='凭证标签名称', required=True, help='用于给凭证做标记')
     _sql_constraints = [('accountcore_rulebook_number_unique', 'unique(number)',
                          '标签编码重复了!'),
@@ -270,8 +316,8 @@ class RuleBook(models.Model, Glob_tag_Model):
         vouchers = self.env['accountcore.voucher'].sudo().search(
             [('ruleBook', '=', self.id)])
         return vouchers
-
     # 获得机构下所有标记的凭证
+
     def getVouchersOfOrg(self, org, periods=None):
         '''获得机构下所有标记的凭证'''
         vouchers = self.getVouchers().filtered(lambda v: v.org.id == org.id)
@@ -281,9 +327,9 @@ class RuleBook(models.Model, Glob_tag_Model):
             return records
         else:
             return vouchers
-
-
 # 科目类别
+
+
 class AccountClass(models.Model, Glob_tag_Model):
     '''会计科目类别'''
     _name = 'accountcore.accountclass'
@@ -295,9 +341,9 @@ class AccountClass(models.Model, Glob_tag_Model):
                          '科目类别编码重复了!'),
                         ('accountcore_accountclass_name_unique', 'unique(name)',
                          '科目类别名称重复了!')]
-
-
 # 会计科目
+
+
 class Account(models.Model, Glob_tag_Model):
     '''会计科目'''
     _name = 'accountcore.account'
@@ -307,17 +353,16 @@ class Account(models.Model, Glob_tag_Model):
                            help="该机构可以使用的科目,不选默认全部机构可用",
                            ondelete='restrict',
                            index=True)
-
     accountsArch = fields.Many2one('accountcore.accounts_arch',
                                    string='所属科目体系',
                                    help="科目所属体系",
                                    index=True,
                                    ondelete='restrict')
-
     accountClass = fields.Many2one('accountcore.accountclass',
                                    string='科目类别',
                                    index=True,
-                                   ondelete='restrict')
+                                   ondelete='restrict',
+                                   required=True)
     number = fields.Char(string='科目编码', required=True)
     name = fields.Char(string='科目名称', required=True)
     direction = fields.Selection([('1', '借'),
@@ -332,7 +377,7 @@ class Account(models.Model, Glob_tag_Model):
                                    help="录入凭证分录时供的核算项目类别",
                                    ondelete='restrict')
     accountItemClass = fields.Many2one('accountcore.itemclass',
-                                       string='作为明细科目的类别',
+                                       string='作为明细科目的类别(凭证中必填项目)',
                                        help="录入凭证分录时必须输输入的核算项目类别,作用相当于明细科目",
                                        ondelete='restrict')
     fatherAccountId = fields.Many2one('accountcore.account',
@@ -347,7 +392,7 @@ class Account(models.Model, Glob_tag_Model):
     currentChildNumber = fields.Integer(default=10,
                                         string='新建下级科目待用编号')
     explain = fields.Html(string='科目说明')
-    itemClassesHtml = fields.Html(string="核算类别",
+    itemClassesHtml = fields.Char(string="核算类别",
                                   help="录入凭证分录时可以选择的核算项目.其中带*的相当于明细科目,为必选.其他不带*的为统计项目,可选",
                                   compute='_itemClassesHtml',
                                   store=True)
@@ -359,6 +404,8 @@ class Account(models.Model, Glob_tag_Model):
     @api.model
     def create(self, values):
         '''新增科目'''
+        if self.env.user.has_group('accountcore.group_role_search'):
+            raise exceptions.AccessDenied("只查询组没有权限")
         self._check_name(values['name'])
         rl = super(Account, self).create(values)
         return rl
@@ -397,8 +444,8 @@ class Account(models.Model, Glob_tag_Model):
     @api.onchange('itemClasses')
     def _checkItemClasses(self):
         '''改变科目的核算项目类别 '''
-        item_ids = [item.id for item in self.itemClasses]
-        if self.accountItemClass and self.accountItemClass.id not in item_ids:
+        # item_ids = [item.id for item in self.itemClasses]
+        if self.accountItemClass and self.accountItemClass.id not in self.itemClasses.ids:
             raise exceptions.ValidationError(
                 '['+self.accountItemClass.name+"]已经作为明细科目的类别,不能删除.如果要删除,请你在'作为明细的类别'中先取消它")
 
@@ -425,30 +472,26 @@ class Account(models.Model, Glob_tag_Model):
             limit = 0
         context = self.env.context
         org_id = context.get('org_id')
+        control_org = context.get('control_org')
+        control_org = control_org if control_org else True
         if org_id:
             # 修改凭证时从上下文取
             org = org_id
         else:
             # 新增时从用户默认值取，凭证机构的change会触发默认值从新设置
             org = self.env.user.currentOrg.id
-        domain = domain+['|', ('org', '=', False), ('org', 'in', [org])]
-        pos = self.search(domain+args, limit=limit, order='number')
+        if control_org:
+            domain = ['|', ('org', '=', False),
+                      ('org', 'in', [org])]+args+domain
+        elif args:
+            domain = ['|', ('org', '=', False)]+args+domain
+        pos = self.search(domain, limit=limit, order='number')
         # return pos.name_get()
         return pos._my_name_get()
 
     @api.model
     @api.multi
     def _my_name_get(self):
-        # 原name_get基类方法:
-        # result = []
-        # name = self._rec_name
-        # if name in self._fields:
-        #     convert = self._fields[name].convert_to_display_name
-        #     for record in self:
-        #         result.append((record.id, convert(record[name], record)))
-        # else:
-        #     for record in self:
-        #         result.append((record.id, "%s,%s" % (record._name, record.id)))
         result = []
         name = self._rec_name
         context = self.env.context
@@ -466,21 +509,15 @@ class Account(models.Model, Glob_tag_Model):
             if show_balance:
                 for record in self:
                     endAmount = record.getEndAmount(org, None)
-                    # showStr = (record['number']).ljust(
-                    #     11, '_') + convert(record[name], record)
                     showStr = (record['number'])+"【" + \
                         convert(record[name], record)+"】"
                     if endAmount != 0:
-                        # showStr = showStr+"__"+'{:,.2f}'.format(endAmount)
                         showStr = showStr+'{:,.2f}'.format(endAmount)
                     result.append((record.id, showStr))
             else:
                 for record in self:
-                    # result.append((record.id,  (record['number']).ljust(
-                    #     11, '_') + convert(record[name], record)))
                     result.append(
                         (record.id,  (record['number'])+"【"+convert(record[name], record)+"】"))
-
         else:
             for record in self:
                 result.append((record.id, "%s,%s" % (record._name, record.id)))
@@ -492,7 +529,7 @@ class Account(models.Model, Glob_tag_Model):
         account = self.browse([accountId])
         itemClasses = account.itemClasses
         accountItemClassId = account.accountItemClass.id
-        return [{'id': i.id, 'name':  (("*"+i.name)
+        return [{'id': i.id, 'name':  (("■"+i.name)
                                        if i.id == accountItemClassId else i.name)}
                 for i in itemClasses]
 
@@ -503,15 +540,14 @@ class Account(models.Model, Glob_tag_Model):
         content = None
         itemTypes = None
         for account in self:
-            content = ""
+            content = []
             if account.itemClasses:
                 accountItemClassId = account.accountItemClass.id
                 itemTypes = account.itemClasses
-                for itemType in itemTypes:
-                    content = content+"<span>\\" + \
-                        ('*'+itemType.name if(itemType.id ==
-                                              accountItemClassId) else itemType.name)+"</span>"
-            account.itemClassesHtml = content
+                content = [('■'+itemType.name) if(itemType.id == accountItemClassId)
+                           else itemType.name for itemType in itemTypes]
+
+            account.itemClassesHtml = '/'.join(content)
         return True
     # 获得科目下的全部明细科目和自生对象的ID
     @api.multi
@@ -519,15 +555,19 @@ class Account(models.Model, Glob_tag_Model):
         '''获得科目下的全部明细科目和自生的ID'''
         self.ensure_one()
         # 通过科目编码来判断
-        return self.search([('number', 'like', self.number)]).mapped('id')
+        # return self.search([('number', 'like', self.number)]).mapped('id')
+        return self.getMeAndChilds().mapped('id')
     # 获得科目下的全部明细科目和自生对象
     @api.multi
     def getMeAndChilds(self):
         '''获得科目下的全部明细科目和自生'''
         self.ensure_one()
         # 通过科目编码来判断
-        return self.search([('number', 'like', self.number)])
-
+        # return self.search([('number', 'like', self.number)])
+        rl = self
+        for c in self.childs_ids:
+            rl = rl | c.getMeAndChilds()
+        return rl
     # 科目在余额表里是否有记录(只比较科目))
 
     def isUsedInBalance(self):
@@ -536,7 +576,6 @@ class Account(models.Model, Glob_tag_Model):
             return True
         else:
             return False
-
     # 获得科目的余额记录，未排序，相同科目下的不同机构和核算项目视为同一科目
 
     def getAllBalances(self):
@@ -545,7 +584,6 @@ class Account(models.Model, Glob_tag_Model):
         account_balances = self.env["accountcore.accounts_balance"].sudo().search(
             domain)
         return account_balances
-
     # 获得科目的余额记录，未排序
 
     def getBalances(self, org=None, item=None):
@@ -588,8 +626,8 @@ class Account(models.Model, Glob_tag_Model):
         rs_sorted = rs.sorted(key=lambda r: (
             r.year, r.month, not r.isbegining))
         return rs_sorted
-
         # 获得当下科目余额记录
+
     def getBalanceOfVoucherPeriod(self, voucher_period, org, item):
         '''获得指定会计期间的科目余额记录'''
         chain = self.getChain(org, item)
@@ -641,10 +679,15 @@ class Account(models.Model, Glob_tag_Model):
                 if self.direction == '1':
                     amount = balance.beginingDamount-balance.beginingCamount
                 else:
-                    amount = balance.beginingCamount-balance.beginingCamount
+                    amount = balance.beginingCamount-balance.beginingDamount
+            # 在启用当年的年初1月
+            elif startP.month == 1:
+                begin = self.getBegins(org, item)
+                if begin and begin.year == startP.year:
+                    amount = begin.begin_year_amount
         return amount
-
     # 获得指定会计期间的期初借方余额
+
     def getBegingDAmountOf(self, voucher_period, org, item):
         '''获得会计期间的期初借方余额'''
         amount = 0
@@ -663,6 +706,14 @@ class Account(models.Model, Glob_tag_Model):
                 amount = balance.beginingDamount-balance.beginingCamount
                 if amount < 0:
                     amount = 0
+            # 在启用当年的年初1月
+            elif startP.month == 1:
+                begin = self.getBegins(org, item)
+                if begin and begin.year == startP.year:
+                    begin_d = begin.beginingDamount-begin.beginCumulativeDamount
+                    begin_c = begin.beginingCamount-begin.beginCumulativeCamount
+                    if abs(begin_d) > abs(begin_c):
+                        amount = begin_d-begin_c
         return amount
     # 获得指定会计期间的期初贷方余额
 
@@ -684,6 +735,14 @@ class Account(models.Model, Glob_tag_Model):
                 amount = balance.beginingCamount-balance.beginingDamount
                 if amount < 0:
                     amount = 0
+            # 在启用当年的年初1月
+            elif startP.month == 1:
+                begin = self.getBegins(org, item)
+                if begin and begin.year == startP.year:
+                    begin_d = begin.beginingDamount-begin.beginCumulativeDamount
+                    begin_c = begin.beginingCamount-begin.beginCumulativeCamount
+                    if abs(begin_d) < abs(begin_c):
+                        amount = begin_c - begin_d
         return amount
     # 获得一个期间的借方发生额
 
@@ -695,8 +754,8 @@ class Account(models.Model, Glob_tag_Model):
             for i in range(0, len(chains)):
                 amount += chains[i].damount
         return amount
-
     # 获得一个期间的贷方发生额
+
     def getCamountBetween(self, start_p, end_p, org, item):
         '''获得一个期间的贷方发生额'''
         chains = self.getBalanceBetween(start_p, end_p, org, item)
@@ -709,7 +768,6 @@ class Account(models.Model, Glob_tag_Model):
 
     def getEndAmountOf(self, end_p, org, item):
         '''获得指定会计期间的期末余额'''
-
         amount = 0
         endP = end_p
         balance = self.getBalanceOfVoucherPeriod(endP, org, item)
@@ -731,8 +789,8 @@ class Account(models.Model, Glob_tag_Model):
             if amount < 0:
                 amount = 0
         return amount
-
     # 期末贷方余额
+
     def getEndCAmount(self, end_p, org, item):
         '''期末借方余额'''
         amount = 0
@@ -743,7 +801,6 @@ class Account(models.Model, Glob_tag_Model):
             if amount < 0:
                 amount = 0
         return amount
-
     # 获得指定会计期间的本年累计金额（借方，贷方）
 
     def getCumulativeAmountOf(self, voucher_period, org, item):
@@ -763,7 +820,6 @@ class Account(models.Model, Glob_tag_Model):
     def getCumulativeCAmountOf(self, voucher_period, org, item):
         '''获得指定会计期间的本年贷方累计'''
         return self.getCumulativeAmountOf(voucher_period, org, item)[1]
-
     # 获得当下科目的余额
 
     def getEndAmount(self, org, item):
@@ -776,7 +832,6 @@ class Account(models.Model, Glob_tag_Model):
             else:
                 amount = balance.endCamount-balance.endDamount
         return amount
-
      # 获得即时本年借方累计
 
     def getCurrentCumulativeDamount(self, org, item):
@@ -786,7 +841,6 @@ class Account(models.Model, Glob_tag_Model):
         if balance:
             amount = balance.cumulativeDamount
         return amount
-
      # 获得即时本年贷方累计
 
     def getCurrentCumulativeCamount(self, org, item):
@@ -796,7 +850,6 @@ class Account(models.Model, Glob_tag_Model):
         if balance:
             amount = balance.cumulativeCamount
         return amount
-
     # 获得科目在余额表中使用过的所有核算项目
 
     def getAllItemsInBalances(self):
@@ -826,7 +879,27 @@ class Account(models.Model, Glob_tag_Model):
     def cancelShowInVoucher(self):
         '''取消凭证中显示'''
         self.write({'is_show': False})
+    # 获取科目带的项目类别,如[[id,true],[id,false]]
 
+    def getAllItemClassIds(self):
+        '''获取科目带的项目类别,如[[id,true],[id,false]]'''
+        itemClass_list = []
+        for i in self.itemClasses:
+            if i.id != self.accountItemClass:
+                itemClass_list.append([i.id, False])
+            else:
+                itemClass_list.append([i.id, True])
+        return itemClass_list
+    # 判断科目已经在余额表中存在
+
+    def haveBeenUsedInBalance(self):
+        '''判断科目在余额表中已被使用过'''
+        accountBalances = self.env['accountcore.accounts_balance'].sudo().search(
+            [('account', '=', self.id)], limit=1)
+        if accountBalances.exists():
+            return True
+        else:
+            return False
 # 特殊的会计科目
 
 
@@ -843,9 +916,9 @@ class SpecialAccounts(models.Model, Glob_tag_Model):
     items = fields.Many2many('accountcore.item', string='核算项目')
     _sql_constraints = [('accountcore_special_accounts_name_unique', 'unique(name)',
                          '特殊性描述重复了!')]
-
-
 # 现金流量类别
+
+
 class CashFlowType(models.Model, Glob_tag_Model):
     '''现金流量类别'''
     _name = 'accountcore.cashflowtype'
@@ -856,9 +929,9 @@ class CashFlowType(models.Model, Glob_tag_Model):
                          '现金流量类别编码重复了!'),
                         ('accountcore_cashflowtype_name_unique', 'unique(name)',
                          '现金流量类别名称重复了!')]
-
-
 # 现金流量
+
+
 class CashFlow(models.Model, Glob_tag_Model):
     '''现金流量项目'''
     _name = 'accountcore.cashflow'
@@ -886,7 +959,7 @@ class CashFlow(models.Model, Glob_tag_Model):
                          '现金流量编码重复了!'),
                         ('accountcore_cashflow_name_unique', 'unique(name)',
                          '现金流量名称重复了!')]
-
+    sequence = fields.Integer(string="显示优先级", help="显示顺序", default=100)
     @api.model
     def name_search(self, name='', args=None, operator='ilike', limit=20):
         args = args or []
@@ -898,7 +971,7 @@ class CashFlow(models.Model, Glob_tag_Model):
         # 源代码默认为160,突破其限制   详细见 /web/static/src/js/views/form_common.js
         if limit == 160:
             limit = 0
-        pos = self.search(domain+args, limit=limit, order='number')
+        pos = self.search(domain+args, limit=limit, order='sequence desc')
         return pos._my_name_get()
 
     @api.model
@@ -916,35 +989,33 @@ class CashFlow(models.Model, Glob_tag_Model):
                 result.append((record.id, showStr))
         else:
             for record in self:
-                # showStr = (record['number']).ljust(
-                #     11, '_') + convert(record[name], record)
                 showStr = ("【" + record['number'])+"】" +\
                     convert(record[name], record)
                 result.append((record.id, "%s,%s" % (showStr, record.id)))
         return result
-
-
 # 凭证文件
+
+
 class VoucherFile(models.Model):
     _name = 'accountcore.voucherfile'
     _description = "凭证相关文件"
     appedixfileType = fields.Char(string='文件类型', required=True)
-
-
 # 凭证来源
+
+
 class Source(models.Model, Glob_tag_Model):
     '''凭证来源'''
     _name = 'accountcore.source'
     _description = '凭证来源'
-    number = fields.Char(string='凭证来源编码', required=True)
+    number = fields.Char(string='凭证来源编码')
     name = fields.Char(string='凭证来源名称', required=True)
     _sql_constraints = [('accountcore_source_number_unique', 'unique(number)',
                          '凭证来源编码重复了!'),
                         ('accountcore_source_name_unique', 'unique(name)',
                          '凭证来源名称重复了!')]
-
-
 # 记账凭证
+
+
 class Voucher(models.Model, Glob_tag_Model):
     '''会计记账凭证'''
     _name = 'accountcore.voucher'
@@ -952,7 +1023,7 @@ class Voucher(models.Model, Glob_tag_Model):
     name = fields.Char(related='uniqueNumber', string="唯一号", store=True)
     voucherdate = fields.Date(string='记账日期',
                               required=True,
-                              placeholder='记账日期')
+                              placeholder='记账日期', default=fields.Date.today())
     real_date = fields.Date(string='业务日期', help='业务实际发生日期')
     # 前端通过voucherDate生成,不要直接修改
     year = fields.Integer(string='年份',
@@ -972,7 +1043,7 @@ class Voucher(models.Model, Glob_tag_Model):
                              required=True,
                              ondelete='restrict')
     org = fields.Many2one('accountcore.org',
-                          string='所属机构',
+                          string='核算机构',
                           required=True,
                           index=True,
                           ondelete='restrict')
@@ -981,10 +1052,8 @@ class Voucher(models.Model, Glob_tag_Model):
                                 index=True,
                                 help='可用于标记不同的凭证',
                                 ondelete='restrict')
-    number = fields.Integer(string='凭证编号',
-                            help='''该编号更据不同凭证编号策略会不同,
-                            一张凭证可以有多个不同编号.可在查询凭证界面批量自动编号.
-                            和原始凭证对应可另用唯一编号''',
+    v_number = fields.Integer(string='凭证号', default=0, group_operator='count')
+    number = fields.Integer(string='策略号',
                             compute='getVoucherNumber',
                             search="searchNumber")
     appendixCount = fields.Integer(string='附件张数',
@@ -1005,14 +1074,14 @@ class Voucher(models.Model, Glob_tag_Model):
     sequence = fields.Integer(string='Sequence')
     entrys = fields.One2many('accountcore.entry',
                              'voucher',
-                             string='分录')
+                             string='分录', copy=True)
     voucherFile = fields.Many2one('accountcore.voucherfile',
                                   string='附件文件',
                                   ondelete='restrict')
     state = fields.Selection([('creating', '制单'),
                               ('reviewed', '已审核')],
                              default='creating', index=True)
-    uniqueNumber = fields.Char(string='唯一编号', help='一张凭证只有一个唯一编号')
+    uniqueNumber = fields.Char(string='唯一编号')
     numberTasticsContainer_str = fields.Char(string='凭证可用编号策略',
                                              default="{}")
     entrysHtml = fields.Html(string="分录内容",
@@ -1023,14 +1092,12 @@ class Voucher(models.Model, Glob_tag_Model):
                                 store=True)
     sum_amount = fields.Monetary(
         string='借贷方差额', default=0, compute='balance_check')
-
     # Monetory类型字段必须有
     currency_id = fields.Many2one('res.currency',
-                                  compute='get_company_currency',
+                                  compute='get_currency',
                                   readonly=True,
-                                  oldname='currency',
-                                  string="Currency",
-                                  help='Utility field to express amount currency')
+                                  string="币别")
+    b_source = fields.Char(string="业务标识")
 
     @api.onchange('org')
     def _set_userdefault_org(self):
@@ -1040,17 +1107,11 @@ class Voucher(models.Model, Glob_tag_Model):
         currentUserTable.write(
             {'currentOrg': self.org.id})
 
-    # @api.multi
-    # def get_company_currency(self):
-    #     self.ensure_one
-    #     # Monetory类型字段必须有 currency_id
-    #     self.currency_id = self.env.user.company_id.currency_id
     @api.multi
-    def get_company_currency(self):
-        # self.ensure_one
+    def get_currency(self):
         # Monetory类型字段必须有 currency_id
         for s in self:
-            s.currency_id = self.env.user.company_id.currency_id
+            s.currency_id = CNY
 
     @api.onchange('entrys')
     def balance_check(self):
@@ -1069,6 +1130,7 @@ class Voucher(models.Model, Glob_tag_Model):
             v.year = v.voucherdate.year
             v.month = v.voucherdate.month
 
+    @ACTools.refuse_role_search
     @api.multi
     def reviewing(self):
         '''审核凭证'''
@@ -1080,13 +1142,14 @@ class Voucher(models.Model, Glob_tag_Model):
     def cancelReview(self):
         '''取消凭证审核'''
         vouchers = self.filtered(lambda v: v.reviewer.id == self.env.uid)
+        if not vouchers.exists():
+            raise exceptions.UserError('没有可供取消审核的凭证,没有选择已经被审计的凭证,只能取消自己审核的凭证')
         for v in vouchers:
             v.write({'state': 'creating', 'reviewer': None})
 
     @api.model
     def create(self, values):
         '''新增凭证'''
-        # 只允许一条分录更新余额表,进程锁
         VOCHER_LOCK.acquire()
         # 出错了，必须释放锁，要不就会死锁
         try:
@@ -1099,9 +1162,20 @@ class Voucher(models.Model, Glob_tag_Model):
                 pass
             else:
                 rl.checkVoucher(values)
+                # 跟新处理并发冲突
             rl.updateBalance()
-            # 跟新处理并发冲突
-            self.env.cr.commit()
+            try:
+                self.env.cr.commit()
+            except:
+                n = self.env.context.get('ac_create_count', 0)
+                if int(n) < 3:
+                    self.env.cr.rollback()
+                    sql_db.flush_env(self.env.cr)
+                    n += 1
+                    rl = self.with_context(
+                        {'ac_create_count': n}) .create(values)
+                else:
+                    raise
         finally:
             VOCHER_LOCK.release()
         return rl
@@ -1119,47 +1193,60 @@ class Voucher(models.Model, Glob_tag_Model):
                 needUpdateBalance = True
             elif 'entrys' in values:
                 es = values['entrys']
+                # n判断如果只是删除分录,也需要更新科目余额表
+                n = 0
                 for e in es:
                     fields = e[2]
                     if not fields:
+                        n = n+1
                         continue
                     if any(['damount' in fields,
-                            'acmount' in fields,
+                            'camount' in fields,
                             'account' in fields,
                             'items' in fields]):
                         needUpdateBalance = True
                         break
+                if n == len(es):
+                    needUpdateBalance = True
             # 先从余额表减去原来的金额
             if needUpdateBalance:
                 self.updateBalance(isAdd=False)
             rl_bool = super(Voucher, self).write(values)
             self.checkVoucher(values)
-            # 再从余额表加上新的金额
+            # 再从余额表加上新的金额ckVouch
             if needUpdateBalance:
                 self.updateBalance()
                 # 跟新处理并发冲突
-                self.env.cr.commit()
+                try:
+                    self.env.cr.commit()
+                except Exception as e:
+                    n = self.env.context.get('ac_write_count', 0)
+                    if int(n) < 3:
+                        self.env.cr.rollback()
+                        sql_db.flush_env(self.env.cr)
+                        n += 1
+                        rl_bool = self.with_context(
+                            {'ac_write_count': n}).write(values)
+                    else:
+                        raise e
+        except Exception as e:
+            raise e
         finally:
             VOCHER_LOCK.release()
         return rl_bool
 
     @api.multi
-    def copy(self, default=None):
+    def copy(self, default=None, my_default={}):
         '''复制凭证'''
+        if "voucherdate" not in my_default:
+            self._checkDate()
         updateFields = {'state': 'creating',
                         'reviewer': None,
                         'createUser': self.env.uid,
-                        'numberTasticsContainer_str': '{}',
-                        'appendixCount': 1}
+                        'numberTasticsContainer_str': '{}'}
+        updateFields.update(my_default)
         rl = super(Voucher, self.with_context(
             {'ac_from_copy': True})).copy(updateFields)
-        VOCHER_LOCK.acquire()
-        try:
-            for entry in self.entrys:
-                entry.copy({'voucher': rl.id})
-            rl.updateBalance()
-        finally:
-            VOCHER_LOCK.release()
         return rl
 
     @api.multi
@@ -1212,11 +1299,22 @@ class Voucher(models.Model, Glob_tag_Model):
     @api.model
     def checkVoucher(self, voucherDist):
         '''凭证检查'''
+        self._checkDate()
         self._checkEntyCount(voucherDist)
         self._checkCDBalance(voucherDist)
         self._checkChashFlow(voucherDist)
         self._checkCDValue(voucherDist)
         self._checkRequiredItemClass()
+    
+    @api.model
+    def _checkDate(self):
+        '''检查凭证日期是否晚于锁定日期'''
+        if self.org.lock_date and self._compareDate(self.voucherdate, self.org.lock_date) != 1:
+            raise exceptions.ValidationError('核算机构:'+str(self.org.name)+'的锁定日期为:' + str(self.org.lock_date)+",操作凭证的记账日期应晚于该日期")
+
+    @tools.ormcache('date1.year', 'date1.month', 'date1.day', 'date2.year', 'date2.month', 'date2.day')
+    def _compareDate(self, date1, date2):
+        return ACTools.compareDate(date1, date2)
 
     @api.model
     def _checkEntyCount(self, voucherDist):
@@ -1261,12 +1359,12 @@ class Voucher(models.Model, Glob_tag_Model):
         content = None
         entrys = None
         for voucher in self:
-            content = "<table class='oe_accountcore_entrys'>"
+            content = "<div class='oe_accountcore_entrys'>"
             if voucher.entrys:
                 entrys = voucher.entrys
                 for entry in entrys:
                     content = content+self._buildingEntryHtml(entry)
-            content = content+"</table>"
+            content = content+"</div>"
             voucher.entrysHtml = content
         return True
 
@@ -1275,33 +1373,31 @@ class Voucher(models.Model, Glob_tag_Model):
     def buildRuleBook(self):
         '''购建凭证标签展示内容'''
         for voucher in self:
-            content = '<table class="ac_rulebook">'
-            for item in voucher.ruleBook:
-                content = content+'<tr><td>'+item.name+'</td></tr>'
-            voucher.roolbook_html = content+"</table>"
+            content = [item.name for item in voucher.ruleBook]
+            voucher.roolbook_html = '/'.join(content)
 
     def _buildingEntryHtml(self, entry):
         '''购建一条分录展示内容'''
         content = ""
         items = ""
         for item in entry.items:
-            items = items+"<div>"+item.name+"</div>"
+            items = items+"【"+item.item_class_name+"】"+item.name
         if entry.explain:
             explain = entry.explain
         else:
             explain = "*"
         damount = format(entry.damount, '0.2f') if entry.damount != 0 else ""
         camount = format(entry.camount, '0.2f') if entry.camount != 0 else ""
-        content = content+"<tr>"+"<td class='oe_ac_explain'>" + \
-            explain+"</td>"+"<td class='oe_ac_account'>" + \
-            entry.account.name+"</td>" + "<td class='o_list_number'>" + \
-            damount+"</td>" + "<td class='o_list_number'>" + \
-            camount+"</td>" + "<td class='oe_ac_items'>" + \
-            items+"</td>"
+        content = content+"<div>"+"<div class='oe_ac_explain'>" + \
+            explain+"</div>"+"<div class='oe_ac_account'>" + \
+            entry.account.name+items+"</div>" + "<div class='o_list_number'>" + \
+            damount+"</div>" + "<div class='o_list_number'>" + \
+            camount+"</div>"
         if entry.cashFlow:
-            content = content+"<td class='oe_ac_cashflow'>"+entry.cashFlow.name+"</td></tr>"
+            content = content+"<div class='oe_ac_cashflow'>" + \
+                entry.cashFlow.name+"</div></div>"
         else:
-            content = content+"<td class='oe_ac_cashflow'></td></tr>"
+            content = content+"<div class='oe_ac_cashflow'></div></div>"
         return content
 
     def searchNumber(self, operater, value):
@@ -1347,7 +1443,6 @@ class Voucher(models.Model, Glob_tag_Model):
             itemId = item.id
         else:
             itemId = False
-
         if isAdd:
             computMark = 1  # 增加金额
         else:
@@ -1371,6 +1466,7 @@ class Voucher(models.Model, Glob_tag_Model):
                     self._modifyBalance(entry_damount,
                                         accountBalance,
                                         entry_camount)
+                    return True
                 # else 不存在就新增一条,但必须是科目的必选核算项目类
                 elif item_.id == itemId:
                     self._buildBalance(True,
@@ -1378,6 +1474,23 @@ class Voucher(models.Model, Glob_tag_Model):
                                        entry,
                                        entry_damount,
                                        entry_camount)
+                    return True
+            # 存在统计项目,不存在核算项的情况,
+            accountBalance = self._getBalanceRecord(entry.account.id)
+            # if 当月已经存在一条该科目的余额记录（不包括启用期初余额那条）
+            if accountBalance.exists():
+                self._modifyBalance(entry_damount,
+                                    accountBalance,
+                                    entry_camount)
+            # else 不存在就新增一条
+            else:
+                # 不排除启用期初那条记录
+                self._buildBalance(False,
+                                   accountBalanceMark,
+                                   entry,
+                                   entry_damount,
+                                   entry_camount)
+            return True
         # else 一条会计分录没有核算项目
         else:
             accountBalance = self._getBalanceRecord(entry.account.id)
@@ -1394,7 +1507,6 @@ class Voucher(models.Model, Glob_tag_Model):
                                    entry,
                                    entry_damount,
                                    entry_camount)
-
         return True
 
     def _modifyBalance(self, entry_damount, accountBalance, entry_camount):
@@ -1415,7 +1527,6 @@ class Voucher(models.Model, Glob_tag_Model):
         pre_balanceRecords = accountBalanceMark.get_pre_balanceRecords_all()
         # 不排除启用期初那条记录
         next_balanceRecords = accountBalanceMark.get_next_balanceRecords_all()
-
         if haveItem:
             newBalanceInfo = dict(accountBalanceMark)
         else:
@@ -1430,6 +1541,7 @@ class Voucher(models.Model, Glob_tag_Model):
             newBalanceInfo['beginingCamount'] = \
                 pre_record.beginingCamount + pre_record.camount
         # 以后月份存在数据就添加以后最近一月那条记录的关联
+        next_record = None
         if next_balanceRecords.exists():
             next_record = next_balanceRecords[0]
             newBalanceInfo['nextRecord'] = next_record.id
@@ -1440,6 +1552,8 @@ class Voucher(models.Model, Glob_tag_Model):
             newBalanceInfo['camount'] = entry_camount
         # 创建新的余额记录
         newBalance = accountBalanceTable.sudo().create(newBalanceInfo)
+        if next_record:
+            next_record.preRecord = newBalance.id
         # 建立和前期余额记录的关联
         if pre_balanceRecords.exists():
             pre_record.nextRecord = newBalance.id
@@ -1462,13 +1576,82 @@ class Voucher(models.Model, Glob_tag_Model):
                                       ['isbegining', '=', False]])
         return record
 
+    @ACTools.refuse_role_search
+    def writeoff(self):
+        '''冲销'''
+        voucher_date = fields.Date.today()
+        if self.env.user.current_date:
+            voucher_date = self.env.user.current_date
+        uniqueNumber = self.uniqueNumber
+        entrys = []
+        for entry in self.entrys:
+            newEntry = {}
+            explain = "【冲销"+uniqueNumber+"号凭证】"
+            if entry.explain:
+                explain = str(entry.explain)+explain
+            newEntry = {"explain": explain,
+                        "account": entry.account.id,
+                        "damount": -entry.damount,
+                        "camount": -entry.camount,
+                        "items": [(6, 0, entry.items.ids)],
+                        "cashFlow": entry.cashFlow.id
+                        }
+            entrys.append((0, 0, newEntry))
+        newVoucher = {'org': self.org.id,
+                      'state': 'reviewed',
+                      'reviewer': self.env.uid,
+                      'createUser': self.env.uid,
+                      'numberTasticsContainer_str': '{}',
+                      'soucre': self.env.ref('accountcore.source_2').id,
+                      'appendixCount': 0,
+                      'voucherdate': voucher_date,
+                      'ruleBook': [(6, 0, [self.env.ref("accountcore.rulebook_8").id])],
+                      'entrys': entrys}
+        rl = self.with_context(
+            {'ac_from_copy': True}).create(newVoucher)
+        return {
+            'name': "冲销",
+            'type': 'ir.actions.act_window',
+            'res_model': 'accountcore.voucher',
+            'view_mode': 'form',
+            'res_id': rl.id,
+        }
+
+    @api.model
+    def show_vouchers(self):
+        '''打开凭证列表窗体'''
+        if self.env.user.currentOrg:
+            context = dict(
+                self.env.context,
+                search_default_this_month=1,
+                search_default_pre_month=1,
+                search_default_org=self.env.user.currentOrg.id,
+            )
+        else:
+            context = dict(
+                self.env.context,
+                search_default_this_month=1,
+                search_default_pre_month=1,
+                search_default_group_by_org=1,
+            )
+        return {
+            'name': '凭证列表',
+            'type': 'ir.actions.act_window',
+            'view_mode': 'list,form,pivot',
+            'res_model': 'accountcore.voucher',
+            'context': context,
+        }
+    
 
 # 分录
+
+
 class Enty(models.Model, Glob_tag_Model):
     '''一条分录'''
     _name = 'accountcore.entry'
     _description = "会计分录"
-    voucher_id = fields.Integer(related="voucher.id")
+    voucher_id = fields.Integer(related="voucher.id", string='voucher_id')
+    v_number = fields.Integer(related="voucher.v_number", string='凭证号', store=True)
     voucher = fields.Many2one('accountcore.voucher',
                               string='所属凭证',
                               index=True,
@@ -1493,10 +1676,9 @@ class Enty(models.Model, Glob_tag_Model):
                              string="月",
                              index=True)
     updata_balance = fields.Boolean(string='是否更新科目余额内部标记', default=False)
-    # sequence = fields.Integer('Sequence')
-    explain = fields.Char(string='说明')
+    explain = fields.Char(string='分录摘要')
     account = fields.Many2one('accountcore.account',
-                              string='科目',
+                              string='会计科目',
                               required=True,
                               index=True,
                               ondelete='restrict')
@@ -1506,11 +1688,9 @@ class Enty(models.Model, Glob_tag_Model):
                              ondelete='restrict')
     # Monetory类型字段必须有
     currency_id = fields.Many2one('res.currency',
-                                  compute='get_company_currency',
+                                  compute='get_currency',
                                   readonly=True,
-                                  oldname='currency',
-                                  string="Currency",
-                                  help='Utility field to express amount currency')
+                                  string="币别")
     # Monetory类型字段必须有currency_id
     damount = fields.Monetary(string='借方金额', default=0)
     # Monetory类型字段必须有currency_id
@@ -1524,17 +1704,17 @@ class Enty(models.Model, Glob_tag_Model):
                                    compute="_getAccountItem",
                                    store=True,
                                    index=True)
-    items_html = fields.Html(string="分录内容",
+    items_html = fields.Html(string="会计科目和核算统计项目",
                              compute='_createItemsHtml',
                              store=True)
     business = fields.Text(string='业务数据')
     @api.multi
-    @api.depends('items.name', 'account_item', 'items.item_class_name')
+    @api.depends('account.name', 'items.name', 'account_item', 'items.item_class_name')
     def _createItemsHtml(self):
         for entry in self:
-            content = ["<div>["+item.item_class_name+"]" +
-                       item.name+"</div>" for item in entry.items]
-            entry.items_html = ''.join(content)
+            content = ["【"+item.item_class_name+"】" +
+                       item.name+"<br/>" for item in entry.items]
+            entry.items_html = str(entry.account.name)+"<br/>"+''.join(content)
 
     @api.multi
     @api.depends('items', 'account')
@@ -1569,15 +1749,11 @@ class Enty(models.Model, Glob_tag_Model):
     def _deleteItemsOnchange(self):
         self.items = None
 
-    # @api.one
-    # def get_company_currency(self):
-    #     # Monetory类型字段必须有 currency_id
-    #     self.currency_id = self.env.user.company_id.currency_id
     @api.multi
-    def get_company_currency(self):
+    def get_currency(self):
         # Monetory类型字段必须有 currency_id
         for s in self:
-            s.currency_id = self.env.user.company_id.currency_id
+            s.currency_id = CNY
 
     @api.model
     def getItemByitemClassId(self, itemClassId):
@@ -1603,22 +1779,53 @@ class Enty(models.Model, Glob_tag_Model):
             'view_type': 'form',
             'view_mode': 'form',
             'res_id': self.voucher_id,
-            'target': 'new',
+            'target': '',
         }
+
+    @api.model
+    def show_vouchers(self):
+        '''打开分录列表窗体'''
+        if self.env.user.currentOrg:
+            context = dict(
+                self.env.context,
+                search_default_this_month=1,
+                search_default_pre_month=1,
+                search_default_org=self.env.user.currentOrg.id,
+            )
+        else:
+            context = dict(
+                self.env.context,
+                search_default_this_month=1,
+                search_default_pre_month=1,
+                search_default_group_by_org=1,
+            )
+        return {
+            'name': '凭证分录列表',
+            'type': 'ir.actions.act_window',
+            'view_mode': 'list,form,pivot',
+            'res_model': 'accountcore.entry',
+            'context': context,
+        }
+
+    def getStatisticsItems(self):
+        '''获得统计项目'''
+        if self.items and self.account_item:
+            return [item for item in self.items if item.id != self.account_item.id]
+        elif self.items:
+            return [item for item in self.items]
+        else:
+            return []
 # 凭证编号策略
 
 
 class VoucherNumberTastics(models.Model, Glob_tag_Model):
-    '''凭证编号的生成策略,一张凭证在不同的策略下有不同的凭证编号,自动生成凭证编号时需要指定一个策略'''
+    '''凭证策略号的生成策略,一张凭证在不同的策略下有不同的凭证策略号,自动生成凭证策略号时需要指定一个策略'''
     _name = 'accountcore.voucher_number_tastics'
-    _description = '凭证编号生成策略'
-    number = fields.Char(string='凭证编号策略编码', required=True)
-    name = fields.Char(string='凭证编号策略', required=True)
-    # is_defualt = fields.Boolean(string='默认使用')
-    _sql_constraints = [('accountcore_voucher_number_tastics_unique', 'unique(number)',
-                         '凭证编号策略编码重复了!'),
-                        ('accountcore_voucher_number_tastics_unique', 'unique(name)',
-                         '凭证编号策略名称重复了!')]
+    _description = '凭证策略号的策略类别'
+    number = fields.Char(string='策略编码')
+    name = fields.Char(string='策略名称', required=True)
+    _sql_constraints = [('accountcore_voucher_number_tastics_unique', 'unique(name)',
+                         '策略名称重复了!')]
 
     @staticmethod
     def get_number(tastics_str, tastics_id):
@@ -1626,13 +1833,14 @@ class VoucherNumberTastics(models.Model, Glob_tag_Model):
         container = json.loads(tastics_str)
         number = container.get(str(tastics_id), 0)
         return number
-
-
 # 科目余额
+
+
 class AccountsBalance(models.Model):
     '''科目余额'''
     _name = 'accountcore.accounts_balance'
     _description = '科目余额'
+    name = fields.Integer(related='id', store=True, group_operator='count')
     org = fields.Many2one(
         'accountcore.org',
         string='所属机构',
@@ -1646,10 +1854,10 @@ class AccountsBalance(models.Model):
     # 通过createDate生成,不要直接修改
     year = fields.Integer(string='年',
                           required=True,
-                          index=True)
+                          index=True, group_operator='count')
     # 通过createDate生成,不要直接修改
-    month = fields.Integer(string='月', required=True, index=True)
-    isbegining = fields.Boolean(string="是启用期间", default=False, index=True)
+    month = fields.Integer(string='月', required=True, index=True, group_operator='count')
+    isbegining = fields.Boolean(string="是启用期间", default=False, index=True, group_operator='count_distinct')
     account = fields.Many2one('accountcore.account',
                               string='会计科目',
                               required=True,
@@ -1665,7 +1873,9 @@ class AccountsBalance(models.Model):
                                        index=True)
     accountItemClass = fields.Many2one('accountcore.itemclass',
                                        string='核算项目类别',
-                                       related='account.accountItemClass')
+                                       related='account.accountItemClass',
+                                       store=True,
+                                       index=True)
     items = fields.Many2one('accountcore.item',
                             string='核算项目',
                             index=True,
@@ -1689,7 +1899,6 @@ class AccountsBalance(models.Model):
                                         compute='getCumulativeCamount',
                                         store=True,
                                         default=0)
-
     beginCumulativeDamount = fields.Monetary(string='月初本年借方累计', default=0)
     beginCumulativeCamount = fields.Monetary(string='月初本年贷方累计', default=0)
     preRecord = fields.Many2one(
@@ -1698,10 +1907,9 @@ class AccountsBalance(models.Model):
         'accountcore.accounts_balance', string='最近后一期记录')
     # Monetory类型字段必须有,要不无法正常显示
     currency_id = fields.Many2one('res.currency',
-                                  compute='get_company_currency',
+                                  compute='get_currency',
                                   readonly=True,
-                                  string="Currency",
-                                  help='Utility field to express amount currency')
+                                  string="币别")
     begin_year_amount = fields.Monetary(
         string="年初余额", compute='_getYearBeginAmount')
 
@@ -1715,7 +1923,7 @@ class AccountsBalance(models.Model):
             if b.account.direction == '1':
                 b.begin_year_amount = begin_d-begin_c
             else:
-                b.begin_year_amount = begin_d-begin_c
+                b.begin_year_amount = begin_c-begin_d
 
     @api.onchange('beginingDamount')
     def _damountChange(self):
@@ -1732,14 +1940,11 @@ class AccountsBalance(models.Model):
     def _deleteItemsOnchange(self):
         self.items = None
 
-    # @api.one
-    # def get_company_currency(self):
-    #     self.currency_id = self.env.user.company_id.currency_id
-    #     pass
     @api.multi
-    def get_company_currency(self):
+    def get_currency(self):
+        # Monetory类型字段必须有 currency_id
         for s in self:
-            s.currency_id = self.env.user.company_id.currency_id
+            s.currency_id = CNY
 
     @api.onchange('createDate')
     @api.depends('createDate')
@@ -1799,32 +2004,45 @@ class AccountsBalance(models.Model):
                 '''不能在该月份创建启用期初，因为在该月前包含有该科目的凭证!
                 删除该科目以前月份的凭证或分录，就可以在该月创建启用期初''')
         else:
-            rl = super(AccountsBalance, self).create(values)
-            # 删除启用期以前的余额记录（不删影响对科目余额表的查询）
-            preBalances = rl.get_pre_balanceRecords(includeCrrentMonth=False)
-            if len(preBalances) > 0:
-                preBalances.unlink()
-            # 更新启用期以后各期的期初余额,
-            nextBalances = (rl.get_next_balanceRecords(
-                includeCurrentMonth=True)).filtered(lambda r: not r.isbegining)
-
-            if len(nextBalances) > 0:
-                rl.setNextBalance(nextBalances[0])
-                rl.changeNextBalanceBegining(rl.endDamount,
-                                             rl.endCamount)
-
+             # 只允许一条分录更新余额表,进程锁
+            VOCHER_LOCK.acquire()
+            # 出错了，必须释放锁，要不就会死锁
+            try:
+                rl = super(AccountsBalance, self).create(values)
+                # 删除启用期以前的余额记录（不删影响对科目余额表的查询）
+                preBalances = rl.get_pre_balanceRecords(
+                    includeCrrentMonth=False)
+                if len(preBalances) > 0:
+                    preBalances.unlink()
+                # 更新启用期以后各期的期初余额,
+                nextBalances = (rl.get_next_balanceRecords(
+                    includeCurrentMonth=True)).filtered(lambda r: not r.isbegining)
+                if len(nextBalances) > 0:
+                    rl.setNextBalance(nextBalances[0])
+                    rl.changeNextBalanceBegining(rl.endDamount,
+                                                 rl.endCamount)
+            finally:
+                VOCHER_LOCK.release()
         return rl
 
     @api.multi
     def unlink(self):
         '''删除科目余额记录'''
+        locked = False
         for mySelf in self:
-            mySelf.deleteRelatedAndUpdate()
-            # if删除的是启用期初，以后各期本年累计需要减去用该启用期初时的本年累计
-            # if mySelf.isbegining:
-            #     mySelf.updateCumulative(-mySelf.cumulativeDamount,
-            #                             -mySelf.cumulativeCamount)
-        rl_bool = super(AccountsBalance, self).unlink()
+            if mySelf.isbegining:
+                VOCHER_LOCK.acquire()
+                locked = True
+                break
+            else:
+                continue
+        try:
+            for mySelf in self:
+                mySelf.deleteRelatedAndUpdate()
+            rl_bool = super(AccountsBalance, self).unlink()
+        finally:
+            if locked:
+                VOCHER_LOCK.release()
         return rl_bool
 
     @api.multi
@@ -1832,79 +2050,81 @@ class AccountsBalance(models.Model):
         '''修改编辑科目余额'''
         self.ensure_one()
         if self.isbegining:
-            if any(['account' in values,
-                    'items' in values,
-                    'year' in values,
-                    'month' in values,
-                    'org' in values]):
-                oldSelf = {}
-                oldSelf['org'] = self.org.id
-                oldSelf['createDate'] = self.createDate
-                oldSelf['year'] = self.year
-                oldSelf['month'] = self.month
-                oldSelf['account'] = self.account.id
-                if (values.setdefault('items', False)):
-                    oldSelf['items'] = self.items.id
-                else:
-                    oldSelf['items'] = None
-                oldSelf['beginingDamount'] = self.beginingDamount
-                oldSelf['beginingCamount'] = self.beginingCamount
-                oldSelf['damount'] = self.damount
-                oldSelf['camount'] = self.camount
-                oldSelf['endDamount'] = self.endDamount
-                oldSelf['endCamount'] = self.endCamount
-                oldSelf['cumulativeDamount'] = self.beginCumulativeDamount+self.damount
-                oldSelf['cumulativeCamount'] = self.beginCumulativeCamount+self.camount
-                oldSelf['beginCumulativeDamount'] = self.beginCumulativeDamount
-                oldSelf['beginCumulativeCamount'] = self.beginCumulativeCamount
-                oldSelf['preRecord'] = None
-                oldSelf['nextRecord'] = None
-                oldSelf['isbegining'] = self.isbegining
-                oldSelf.update(values)
-                # 改变科目后，如果科目有必选项目类别，判断是否输入
-                if not oldSelf['items']:
-                    newAccount = self.env['accountcore.account'].sudo().browse([
-                        oldSelf['account']])
-                    itemClass_need = newAccount.accountItemClass
-                    if itemClass_need.id:
+            VOCHER_LOCK.acquire()
+            try:
+                if any(['account' in values,
+                        'items' in values,
+                        'year' in values,
+                        'month' in values,
+                        'org' in values]):
+                    oldSelf = {}
+                    oldSelf['org'] = self.org.id
+                    oldSelf['createDate'] = self.createDate
+                    oldSelf['year'] = self.year
+                    oldSelf['month'] = self.month
+                    oldSelf['account'] = self.account.id
+                    if (values.setdefault('items', False)):
+                        oldSelf['items'] = self.items.id
+                    else:
+                        oldSelf['items'] = None
+                    oldSelf['beginingDamount'] = self.beginingDamount
+                    oldSelf['beginingCamount'] = self.beginingCamount
+                    oldSelf['damount'] = self.damount
+                    oldSelf['camount'] = self.camount
+                    oldSelf['endDamount'] = self.endDamount
+                    oldSelf['endCamount'] = self.endCamount
+                    oldSelf['cumulativeDamount'] = self.beginCumulativeDamount+self.damount
+                    oldSelf['cumulativeCamount'] = self.beginCumulativeCamount+self.camount
+                    oldSelf['beginCumulativeDamount'] = self.beginCumulativeDamount
+                    oldSelf['beginCumulativeCamount'] = self.beginCumulativeCamount
+                    oldSelf['preRecord'] = None
+                    oldSelf['nextRecord'] = None
+                    oldSelf['isbegining'] = self.isbegining
+                    oldSelf.update(values)
+                    # 改变科目后，如果科目有必选项目类别，判断是否输入
+                    if not oldSelf['items']:
+                        newAccount = self.env['accountcore.account'].sudo().browse([
+                            oldSelf['account']])
+                        itemClass_need = newAccount.accountItemClass
+                        if itemClass_need.id:
+                            raise exceptions.ValidationError(
+                                newAccount.name+" 科目的 "+itemClass_need.name+' 为必须录入项目')
+                    if self._check_preVoucherExist(oldSelf):
+                        raise exceptions.ValidationError('''不能在该月份创建启用期初，因为在该月前包含有该科目的凭证!
+                    删除该科目以前月份的凭证或分录，就可以在该月创建启用期初''')
+                    if self._check_repeat(oldSelf):
                         raise exceptions.ValidationError(
-                            newAccount.name+" 科目的 "+itemClass_need.name+' 为必须录入项目')
-
-                if self._check_preVoucherExist(oldSelf):
-                    raise exceptions.ValidationError('''不能在该月份创建启用期初，因为在该月前包含有该科目的凭证!
-                删除该科目以前月份的凭证或分录，就可以在该月创建启用期初''')
-                if self._check_repeat(oldSelf):
-                    raise exceptions.ValidationError(
-                        '''已经存在一条相同科目的期初余额记录行,请取消,在另一行已存在的记录上修改!
-                        若不想保留本行，请勾选本行，并在动作中选择删除操作''')
-                # 删除旧关系，更新原有余额记录链各种金额，但不删除记录
-                self.deleteRelatedAndUpdate()
-
-                rl_bool = super(AccountsBalance, self).write(oldSelf)
-                # 删除启用期以前的余额记录（不删影响对科目余额表的查询）
-                preBalances = self.get_pre_balanceRecords(
-                    includeCrrentMonth=False)
-                if len(preBalances) > 0:
-                    preBalances.unlink()
-                # 添加新的关系，更新新的余额记录链条各种金额
-                self.buildRelatedAndUpdate()
-                return rl_bool
-            else:
-                # 更新启用期初的本年累计
-                if 'beginCumulativeDamount' in values:
-                    values.update(
-                        {'cumulativeDamount': values['beginCumulativeDamount']})
-                if 'beginCumulativeCamount' in values:
-                    values.update(
-                        {'cumulativeCamount': values['beginCumulativeCamount']})
-                rool_bool = super(AccountsBalance, self).write(values)
-                # 跟新本期及以后期间的科目余额记录的期初余额
-                nextBalances = (self.get_next_balanceRecords(True)).filtered(
-                    lambda r: not r.isbegining)
-                if len(nextBalances) > 0:
-                    self.changeNextBalanceBegining(
-                        self.endDamount, self.endCamount)
-                return rool_bool
+                            '''已经存在一条相同科目的期初余额记录行,请取消,在另一行已存在的记录上修改!
+                            若不想保留本行，请勾选本行，并在动作中选择删除操作''')
+                    # 删除旧关系，更新原有余额记录链各种金额，但不删除记录
+                    self.deleteRelatedAndUpdate()
+                    rl_bool = super(AccountsBalance, self).write(oldSelf)
+                    # 删除启用期以前的余额记录（不删影响对科目余额表的查询）
+                    preBalances = self.get_pre_balanceRecords(
+                        includeCrrentMonth=False)
+                    if len(preBalances) > 0:
+                        preBalances.unlink()
+                    # 添加新的关系，更新新的余额记录链条各种金额
+                    self.buildRelatedAndUpdate()
+                    return rl_bool
+                else:
+                    # 更新启用期初的本年累计
+                    if 'beginCumulativeDamount' in values:
+                        values.update(
+                            {'cumulativeDamount': values['beginCumulativeDamount']})
+                    if 'beginCumulativeCamount' in values:
+                        values.update(
+                            {'cumulativeCamount': values['beginCumulativeCamount']})
+                    rool_bool = super(AccountsBalance, self).write(values)
+                    # 跟新本期及以后期间的科目余额记录的期初余额
+                    nextBalances = (self.get_next_balanceRecords(True)).filtered(
+                        lambda r: not r.isbegining)
+                    if len(nextBalances) > 0:
+                        self.changeNextBalanceBegining(
+                            self.endDamount, self.endCamount)
+                    return rool_bool
+            finally:
+                VOCHER_LOCK.release()
         else:
             rl_bool = super(AccountsBalance, self).write(values)
             return rl_bool
@@ -2036,7 +2256,6 @@ class AccountsBalance(models.Model):
             lambda r: not r.isbegining)
         preBalances = self.get_pre_balanceRecords(includeCrrentMonth=False)
         if len(nextBalances) > 0:
-
             self.setNextBalance(nextBalances[0])
             self.changeNextBalanceBegining(self.endDamount,
                                            self.endCamount)
@@ -2088,7 +2307,6 @@ class AccountsBalance(models.Model):
             itemId = item.id
         else:
             itemId = False
-
         if isAdd:
             computMark = 1  # 增加金额
         else:
@@ -2135,7 +2353,6 @@ class AccountsBalance(models.Model):
                                    entry,
                                    entry_damount,
                                    entry_camount)
-
         return True
 
     @api.model
@@ -2164,7 +2381,7 @@ class AccountsBalance(models.Model):
                                        ('items', '=', accountBalance['items']),
                                        ('isbegining', '=', True),
                                        ('year', '=', accountBalance['year']),
-                                       ('month', '=', accountBalance['month'])])
+                                       ('month', '=', accountBalance['month'])], limit=1)
             else:
                 records = self.search([('org', '=', accountBalance['org']),
                                        ('year', '=', accountBalance['year']),
@@ -2172,8 +2389,7 @@ class AccountsBalance(models.Model):
                                        ('account', '=',
                                         accountBalance['account']),
                                        ('items', '=', accountBalance['items']),
-                                       ('isbegining', '=', False)])
-
+                                       ('isbegining', '=', False)], limit=1)
         else:
             if accountBalance['isbegining'] == True:
                 records = self.search([('org', '=', accountBalance['org']),
@@ -2188,7 +2404,7 @@ class AccountsBalance(models.Model):
                                        ('month', '=', accountBalance['month']),
                                        ('account', '=',
                                         accountBalance['account']),
-                                       ('isbegining', '=', False)])
+                                       ('isbegining', '=', False)], limit=1)
         if records.exists():
             return True
         return False
@@ -2201,7 +2417,7 @@ class AccountsBalance(models.Model):
                   '|', ('v_year', '<', value['year']),
                   '&', ('v_year', '=', value['year']),
                   ('v_month', '<', value['month'])]
-        entrys = self.env['accountcore.entry'].sudo().search(domain)
+        entrys = self.env['accountcore.entry'].sudo().search(domain, limit=1)
         if len(entrys) > 0:
             return True
         return False
@@ -2225,9 +2441,9 @@ class AccountsBalance(models.Model):
         fieldsValue_ = [(Decimal.from_float(v)).quantize(
             Decimal('0.00')) for v in fieldsValue]
         return sum(fieldsValue_)
-
-
 # 科目余额用对象
+
+
 class AccountBalanceMark(object):
     def __init__(self, orgId, accountId, itemId, createDate, accountBalanceTable, isbegining):
         self.org = orgId
